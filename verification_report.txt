@@ -1,0 +1,14 @@
+version_v30_present: PASS
+dynamic_name_guard_present: PASS
+underdog_relationship_parser_present: PASS
+line_text_parser_present: PASS
+nba_leak_blocker_present: PASS
+dota_esports_blocker_present: PASS
+stats_default_off: PASS
+saved_dataframe_ternary_removed: PASS
+results_dataframe_ternary_removed: PASS
+request_log_safe_block: PASS
+no_dataframe_ternary_patterns: PASS
+
+Risky dataframe ternaries found:
+None
