@@ -19,7 +19,7 @@ import pandas as pd
 import requests
 import streamlit as st
 
-APP_VERSION = "WNBA v2.4 UNDERDOG RELAXED PARSER"
+APP_VERSION = "WNBA v2.5 UNDERDOG RELATIONSHIP PARSER"
 
 # =========================
 # STORAGE
@@ -286,6 +286,223 @@ def object_mentions_other_basketball_league(text):
     return " nba" in raw or " basketball_nba" in raw or " mens basketball" in raw or " men basketball" in raw
 
 
+def ud_attrs(obj):
+    """Return Underdog attrs merged with top-level fields."""
+    if not isinstance(obj, dict):
+        return {}
+    out = {}
+    attrs = obj.get("attributes")
+    if isinstance(attrs, dict):
+        out.update(attrs)
+    for k, v in obj.items():
+        if k not in ["attributes", "relationships", "included", "data"]:
+            out.setdefault(k, v)
+    return out
+
+def underdog_object_key(obj):
+    if not isinstance(obj, dict):
+        return None
+    oid = obj.get("id")
+    typ = obj.get("type")
+    if oid is None:
+        return None
+    return (str(typ or ""), str(oid))
+
+def build_underdog_id_index(data):
+    """Index every typed/id object so line rows can resolve player/market/league relationships."""
+    idx = {}
+    for obj in flatten_json(data):
+        if not isinstance(obj, dict):
+            continue
+        key = underdog_object_key(obj)
+        if key:
+            idx[key] = obj
+            # also keep id-only fallback because some relationships omit type
+            idx[("", key[1])] = obj
+    return idx
+
+def relationship_refs(obj):
+    refs = []
+    if not isinstance(obj, dict):
+        return refs
+    rels = obj.get("relationships")
+    if not isinstance(rels, dict):
+        return refs
+
+    def add_ref(x):
+        if isinstance(x, dict):
+            if "data" in x:
+                add_ref(x.get("data"))
+                return
+            rid = x.get("id")
+            typ = x.get("type")
+            if rid is not None:
+                refs.append((str(typ or ""), str(rid)))
+        elif isinstance(x, list):
+            for item in x:
+                add_ref(item)
+
+    for v in rels.values():
+        add_ref(v)
+    return refs
+
+def combine_obj_and_related_text(obj, idx, depth=2):
+    """Collect text from an Underdog object and its related objects."""
+    seen = set()
+    parts = []
+
+    def walk(o, d):
+        if not isinstance(o, dict) or d < 0:
+            return
+        key = underdog_object_key(o)
+        if key and key in seen:
+            return
+        if key:
+            seen.add(key)
+
+        a = ud_attrs(o)
+        for k, v in a.items():
+            if isinstance(v, (str, int, float, bool)) and v not in [None, ""]:
+                parts.append(f"{k}:{v}")
+            elif isinstance(v, dict):
+                for kk, vv in v.items():
+                    if isinstance(vv, (str, int, float, bool)) and vv not in [None, ""]:
+                        parts.append(f"{k}.{kk}:{vv}")
+
+        # include a small JSON slice because some Underdog versions store names deep
+        try:
+            parts.append(json.dumps(o, default=str)[:1800])
+        except Exception:
+            pass
+
+        for ref in relationship_refs(o):
+            ro = idx.get(ref) or idx.get(("", ref[1]))
+            if ro is not None:
+                walk(ro, d - 1)
+
+    walk(obj, depth)
+    return " | ".join(parts)
+
+def candidate_player_name_from_text_and_related(obj, idx):
+    """Find a real player/athlete name from object or relationships."""
+    candidates = []
+    checked = []
+
+    def add_from(o):
+        if not isinstance(o, dict):
+            return
+        checked.append(o)
+        a = ud_attrs(o)
+        for k in [
+            "player_name", "athlete_name", "full_name", "display_name", "name",
+            "title", "first_name", "last_name", "abbr_name", "short_name"
+        ]:
+            v = a.get(k)
+            if isinstance(v, str) and len(v.strip()) >= 3:
+                candidates.append(v.strip())
+        # Join first/last when split
+        fn = a.get("first_name")
+        ln = a.get("last_name")
+        if isinstance(fn, str) and isinstance(ln, str):
+            candidates.append((fn + " " + ln).strip())
+
+    add_from(obj)
+    for ref in relationship_refs(obj):
+        ro = idx.get(ref) or idx.get(("", ref[1]))
+        add_from(ro)
+        if isinstance(ro, dict):
+            for ref2 in relationship_refs(ro):
+                ro2 = idx.get(ref2) or idx.get(("", ref2[1]))
+                add_from(ro2)
+
+    # Filter out market names and team/event titles.
+    good = []
+    for c in candidates:
+        cc = c.strip()
+        low = cc.lower()
+        if detect_market(cc):
+            continue
+        if any(x in low for x in ["over", "under", "points", "rebounds", "assists", "fantasy", "wnba", "nba", "vs ", " @ "]):
+            continue
+        # must look like a person: at least first + last
+        if len(cc.split()) >= 2:
+            good.append(cc)
+
+    if good:
+        # prefer shortest clean full name, not a huge title
+        good = sorted(set(good), key=lambda x: (len(x), x))
+        return good[0]
+    return None
+
+def extract_underdog_line_from_obj_or_related(obj, idx, market=None):
+    """Find the numeric prop line from object or related line/option objects."""
+    keys = [
+        "stat_value", "line_score", "over_under_line", "target_value", "line",
+        "value", "over_under", "total", "points", "line_value"
+    ]
+
+    def scan(o):
+        if not isinstance(o, dict):
+            return None
+        a = ud_attrs(o)
+        for k in keys:
+            f = safe_float(a.get(k))
+            if f is not None:
+                return f
+        return None
+
+    line = scan(obj)
+    if line is not None:
+        return line
+
+    for ref in relationship_refs(obj):
+        ro = idx.get(ref) or idx.get(("", ref[1]))
+        line = scan(ro)
+        if line is not None:
+            return line
+        if isinstance(ro, dict):
+            for ref2 in relationship_refs(ro):
+                ro2 = idx.get(ref2) or idx.get(("", ref2[1]))
+                line = scan(ro2)
+                if line is not None:
+                    return line
+    return None
+
+def sane_wnba_line(market, line):
+    line = safe_float(line)
+    if line is None:
+        return None
+    # Avoid metadata numbers like IDs, ranks, timestamps.
+    ranges = {
+        "points": (0.5, 45.5),
+        "rebounds": (0.5, 22.5),
+        "assists": (0.5, 16.5),
+        "pts_rebs_asts": (3.5, 75.5),
+        "pts_rebs": (2.5, 65.5),
+        "pts_asts": (2.5, 60.5),
+        "rebs_asts": (1.5, 35.5),
+        "threes": (0.5, 7.5),
+        "steals": (0.5, 5.5),
+        "blocks": (0.5, 5.5),
+    }
+    lo, hi = ranges.get(market, (0.5, 80.0))
+    if not (lo <= line <= hi):
+        return None
+    # Props can be whole on fantasy apps sometimes, but most are half. Allow both.
+    return float(line)
+
+def underdog_text_is_wnba(text, payload_has_wnba=False):
+    raw = " " + str(text or "").lower() + " "
+    if has_bad_cross_sport_terms(raw):
+        return False
+    if object_mentions_other_basketball_league(raw):
+        return False
+    if " wnba" in raw or " women" in raw or " women's" in raw:
+        return True
+    # If the full payload has WNBA, allow relationship-resolved rows that do not spell WNBA themselves.
+    return bool(payload_has_wnba)
+
+
 # =========================
 # BETTING MATH
 # =========================
@@ -449,106 +666,99 @@ def clean_prop_rows(rows):
 
 @st.cache_data(ttl=120, show_spinner=False)
 def fetch_underdog_wnba_props():
-    """Parse Underdog WNBA prop rows.
+    """Relationship-aware Underdog WNBA parser.
 
-    v2.4 fix: Underdog sometimes stores league/sport info away from the exact
-    over_under object. The older parser required every flattened object to say
-    WNBA, which hid posted tomorrow lines. This parser first tries strict WNBA
-    object matches, then a safer relaxed pass that only activates if the full
-    payload contains WNBA and the row has player + supported market + real line.
+    v2.5 fix:
+    Underdog separates the player, market, league, and line across related objects.
+    The old parser saw payload_has_wnba=True but found OK_NO_WNBA_ROWS because
+    no single flattened object had all fields. This version resolves relationships.
     """
     all_rows = []
-    debug_counts = []
 
     for url in UNDERDOG_URLS:
-        data = safe_get_json(url, timeout=10)
+        data = safe_get_json(url, timeout=12)
         if not data:
-            debug_counts.append(f"{url}: no json")
             continue
 
         payload_text = json.dumps(data, default=str).lower()
         payload_has_wnba = ("wnba" in payload_text) or ("women" in payload_text) or ("women's" in payload_text)
+        idx = build_underdog_id_index(data)
         objects = flatten_json(data)
-        strict_rows = []
-        relaxed_rows = []
+        rows = []
+        debug_candidates = 0
+        debug_market = 0
+        debug_name = 0
+        debug_line = 0
 
         for obj in objects:
             if not isinstance(obj, dict):
                 continue
 
-            text_blob = json.dumps(obj, default=str).lower()
-            if has_bad_cross_sport_terms(text_blob) or object_mentions_other_basketball_league(text_blob):
-                continue
+            combined = combine_obj_and_related_text(obj, idx, depth=2)
+            combined_low = combined.lower()
 
-            obj_has_wnba = ("wnba" in text_blob) or ("women" in text_blob) or ("women's" in text_blob)
-            if not obj_has_wnba and not payload_has_wnba:
+            # Must pass WNBA/cross-sport protection.
+            if not underdog_text_is_wnba(combined_low, payload_has_wnba=payload_has_wnba):
                 continue
+            debug_candidates += 1
 
-            market_text = " ".join(str(obj.get(k, "")) for k in [
-                "over_under", "over_under_title", "stat_type", "stat", "title",
-                "appearance_stat", "display_stat", "option_display", "market", "market_name",
-                "name", "description"
-            ])
-            market = detect_market(market_text) or detect_market(text_blob)
+            market = detect_market(combined)
             if market is None:
                 continue
+            debug_market += 1
 
-            name = None
-            for k in ["player_name", "athlete_name", "title", "name", "full_name", "display_name"]:
-                val = obj.get(k)
-                if isinstance(val, str) and len(val.split()) >= 2 and not detect_market(val):
-                    name = val
+            name = candidate_player_name_from_text_and_related(obj, idx)
+            if not name:
+                continue
+            debug_name += 1
+
+            raw_line = extract_underdog_line_from_obj_or_related(obj, idx, market=market)
+            line = sane_wnba_line(market, raw_line)
+            if line is None:
+                continue
+            debug_line += 1
+
+            prop_date = parse_prop_date_from_text_or_obj(obj)
+            price = -110
+            a = ud_attrs(obj)
+            for pk in ["american_price", "price", "odds"]:
+                p = safe_float(a.get(pk))
+                if p is not None and -10000 < p < 10000:
+                    price = p
                     break
 
-            if not name:
-                for k in ["player", "athlete", "appearance", "participant"]:
-                    nested = obj.get(k)
-                    if isinstance(nested, dict):
-                        for nk in ["name", "full_name", "display_name", "player_name", "title"]:
-                            val = nested.get(nk)
-                            if isinstance(val, str) and len(val.split()) >= 2 and not detect_market(val):
-                                name = val
-                                break
-                    if name:
-                        break
-
-            line = extract_number_line(obj)
-            if not name or line is None:
-                continue
-
-            # Guard against weird metadata numbers. Main WNBA props should be half or whole numbers in a sane range.
-            if line < 0.5 or line > 80:
-                continue
-
-            price = safe_float(obj.get("american_price"), -110) or -110
-            prop_date = parse_prop_date_from_text_or_obj(obj)
-            row = {
+            rows.append({
                 "Player": name,
                 "Market": market,
                 "Market Label": MARKET_LABELS.get(market, market),
                 "Line": float(line),
                 "Source": "Underdog",
                 "Price": price,
-                "Raw Market": market_text[:140],
+                "Raw Market": combined[:180],
                 "Real Line": True,
                 "Prop Date": prop_date,
                 "Game Day": day_label_from_date(prop_date),
-                "Parser Mode": "strict-object-wnba" if obj_has_wnba else "relaxed-payload-wnba",
-            }
-            if obj_has_wnba:
-                strict_rows.append(row)
-            else:
-                relaxed_rows.append(row)
+                "Parser Mode": "relationship-aware-v2.5",
+            })
 
-        chosen = strict_rows if strict_rows else relaxed_rows
-        if chosen:
-            all_rows.extend(chosen)
-            log_source_request(url, "OK", f"{len(chosen)} WNBA props parsed ({'strict' if strict_rows else 'relaxed'})")
+        rows = clean_prop_rows(rows)
+        if rows:
+            all_rows.extend(rows)
+            log_source_request(
+                url,
+                "OK",
+                f"{len(rows)} WNBA props parsed relationship-aware | candidates={debug_candidates}, market={debug_market}, name={debug_name}, line={debug_line}, objects={len(objects)}"
+            )
             break
         else:
-            log_source_request(url, "OK_NO_WNBA_ROWS", f"payload_has_wnba={payload_has_wnba}, objects={len(objects)}")
+            log_source_request(
+                url,
+                "OK_NO_WNBA_ROWS",
+                f"payload_has_wnba={payload_has_wnba}, candidates={debug_candidates}, market={debug_market}, name={debug_name}, line={debug_line}, objects={len(objects)}"
+            )
 
     return clean_prop_rows(all_rows)
+
 
 @st.cache_data(ttl=180, show_spinner=False)
 def fetch_prizepicks_wnba_props():
@@ -926,7 +1136,7 @@ with st.sidebar:
     st.header("Controls")
     source_choice = st.selectbox("Line source", ["Underdog first", "Underdog only", "PrizePicks backup only", "All available"], index=0)
     season = st.text_input("WNBA season", value=os.getenv("WNBA_SEASON", "2025"))
-    load_stats = st.checkbox("Use WNBA stats endpoint for projections", value=True)
+    load_stats = st.checkbox("Use WNBA stats endpoint for projections", value=False)
     selected_day = st.radio("Board filter", ["All Lines", "Today", "Tomorrow"], horizontal=True)
     st.divider()
     st.caption("Filters")
