@@ -19,7 +19,7 @@ import pandas as pd
 import requests
 import streamlit as st
 
-APP_VERSION = "WNBA v2.9 NBA LEAK BLOCKER"
+APP_VERSION = "WNBA v3.0 DYNAMIC WNBA NAME GUARD"
 
 # =========================
 # STORAGE
@@ -720,6 +720,64 @@ def is_likely_wnba_name(name, combined_text=""):
     # If no explicit WNBA marker, do not accept random names from a mixed Underdog payload.
     return False
 
+
+def extract_dynamic_wnba_names_from_payload(data):
+    """Build WNBA player allowlist from Underdog's own WNBA-linked objects.
+
+    This fixes logs where name/line are found but every row is rejected because
+    the static WNBA list is incomplete.
+    """
+    names = set()
+    objects = flatten_json(data)
+
+    def add_name(v):
+        if not isinstance(v, str):
+            return
+        cleaned = strip_market_words_from_title(v) or v.strip()
+        if not cleaned:
+            return
+        if is_bad_player_like_name(cleaned):
+            return
+        if is_known_nba_name(cleaned):
+            return
+        # Avoid event/team strings
+        low = cleaned.lower()
+        if any(x in low for x in [" vs ", " vs. ", " @ ", "dota", "gaming", "esports"]):
+            return
+        if 2 <= len(cleaned.split()) <= 4:
+            names.add(normalize_name(cleaned))
+
+    for obj in objects:
+        if not isinstance(obj, dict):
+            continue
+        blob = json.dumps(obj, default=str).lower()
+        if not ("wnba" in blob or "women" in blob or "women's" in blob or "basketball_wnba" in blob):
+            continue
+        a = ud_attrs(obj)
+        fn = a.get("first_name")
+        ln = a.get("last_name")
+        if isinstance(fn, str) and isinstance(ln, str):
+            add_name(fn + " " + ln)
+        for k in [
+            "player_name", "athlete_name", "full_name", "display_name", "name",
+            "title", "display_title", "description", "over_under_title", "option_display"
+        ]:
+            add_name(a.get(k))
+    return names
+
+def is_likely_wnba_name_dynamic(name, combined_text="", dynamic_names=None):
+    n = normalize_name(name)
+    raw = " " + str(combined_text or "").lower() + " "
+    if is_known_nba_name(name):
+        return False
+    if n in WNBA_NAME_ALLOW_HINTS:
+        return True
+    if dynamic_names and n in dynamic_names:
+        return True
+    if " wnba" in raw or "women" in raw or "women's" in raw or "basketball_wnba" in raw:
+        return True
+    return False
+
 def underdog_text_is_wnba(text, payload_has_wnba=False):
     raw = " " + str(text or "").lower() + " "
 
@@ -924,6 +982,7 @@ def fetch_underdog_wnba_props():
         payload_has_wnba = ("wnba" in payload_text) or ("women" in payload_text) or ("women's" in payload_text)
         idx = build_underdog_id_index(data)
         objects = flatten_json(data)
+        dynamic_wnba_names = extract_dynamic_wnba_names_from_payload(data)
         rows = []
         debug_candidates = 0
         debug_market = 0
@@ -972,7 +1031,7 @@ def fetch_underdog_wnba_props():
             if is_bad_player_like_name(name):
                 debug_rejected_name += 1
                 continue
-            if not is_likely_wnba_name(name, combined):
+            if not is_likely_wnba_name_dynamic(name, combined, dynamic_wnba_names):
                 debug_rejected_name += 1
                 continue
 
@@ -992,17 +1051,18 @@ def fetch_underdog_wnba_props():
 
         rows = clean_prop_rows(rows)
 
-        # Debug sample: if we found markets but no names/lines, store a tiny clue.
+        # Debug sample: if we found names/lines but rejected all, show dynamic allowlist size and one sample.
         if not rows and (debug_market > 0 or debug_name > 0):
             try:
                 sample_text = ""
-                for obj2 in objects[:600]:
+                for obj2 in objects[:900]:
                     c2 = combine_obj_and_related_text(obj2, idx, depth=1)
-                    if detect_market(c2):
-                        sample_text = c2[:500]
+                    nm2 = candidate_player_name_from_text_and_related(obj2, idx)
+                    if detect_market(c2) and nm2:
+                        sample_text = f"dynamic_names={len(dynamic_wnba_names)} | sample_name={nm2} | sample_text={c2[:420]}"
                         break
                 if sample_text:
-                    log_source_request(url, "DEBUG_MARKET_SAMPLE", sample_text)
+                    log_source_request(url, "DEBUG_REJECT_SAMPLE", sample_text)
             except Exception:
                 pass
 
@@ -1011,14 +1071,14 @@ def fetch_underdog_wnba_props():
             log_source_request(
                 url,
                 "OK",
-                f"{len(rows)} WNBA props parsed relationship-aware | candidates={debug_candidates}, market={debug_market}, name={debug_name}, line={debug_line}, rejected_name={debug_rejected_name}, objects={len(objects)}"
+                f"{len(rows)} WNBA props parsed relationship-aware | candidates={debug_candidates}, market={debug_market}, name={debug_name}, line={debug_line}, rejected_name={debug_rejected_name}, dynamic_names={len(dynamic_wnba_names)}, objects={len(objects)}"
             )
             break
         else:
             log_source_request(
                 url,
                 "OK_NO_WNBA_ROWS",
-                f"payload_has_wnba={payload_has_wnba}, candidates={debug_candidates}, market={debug_market}, name={debug_name}, line={debug_line}, rejected_name={debug_rejected_name}, objects={len(objects)}"
+                f"payload_has_wnba={payload_has_wnba}, candidates={debug_candidates}, market={debug_market}, name={debug_name}, line={debug_line}, rejected_name={debug_rejected_name}, dynamic_names={len(dynamic_wnba_names)}, objects={len(objects)}"
             )
 
     return clean_prop_rows(all_rows)
