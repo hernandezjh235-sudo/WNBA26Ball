@@ -19,7 +19,7 @@ import pandas as pd
 import requests
 import streamlit as st
 
-APP_VERSION = "WNBA v3.0 DYNAMIC WNBA NAME GUARD"
+APP_VERSION = "WNBA v3.1 ACCEPT VALID WNBA ROWS"
 
 # =========================
 # STORAGE
@@ -778,6 +778,49 @@ def is_likely_wnba_name_dynamic(name, combined_text="", dynamic_names=None):
         return True
     return False
 
+
+def should_accept_underdog_wnba_row(name, combined_text="", dynamic_names=None):
+    """Final guard for Underdog rows.
+
+    v3.1 fix:
+    Logs showed: name > 0, line > 0, rejected_name == line.
+    That means valid rows reached the final guard but were rejected because the
+    WNBA allowlist was too strict. This accepts valid-looking player names as long
+    as they do not look like NBA/esports/event/team rows.
+    """
+    if is_bad_player_like_name(name):
+        return False
+    if is_known_nba_name(name):
+        return False
+
+    n = normalize_name(name)
+    raw = " " + str(combined_text or "").lower() + " "
+
+    # Hard wrong-sport/event blocks.
+    if any(x in raw for x in [
+        " dota", "esports", "counter-strike", " cs2", "valorant",
+        "league of legends", "natus vincere", "xtreme gaming"
+    ]):
+        return False
+    if object_mentions_other_basketball_league(raw):
+        return False
+
+    # Strong WNBA evidence.
+    if n in WNBA_NAME_ALLOW_HINTS:
+        return True
+    if dynamic_names and n in dynamic_names:
+        return True
+    if " wnba" in raw or " women" in raw or " women's" in raw or "basketball_wnba" in raw:
+        return True
+
+    # Soft fallback: if the payload relationship already passed WNBA checks and
+    # name looks like a real person, accept it unless it is a known NBA name.
+    # This is necessary because Underdog sometimes separates sport/league from player rows.
+    if 2 <= len(str(name).split()) <= 4:
+        return True
+
+    return False
+
 def underdog_text_is_wnba(text, payload_has_wnba=False):
     raw = " " + str(text or "").lower() + " "
 
@@ -1028,10 +1071,7 @@ def fetch_underdog_wnba_props():
                     break
 
             # Final WNBA-only safety: reject non-player/event/team/NBA titles.
-            if is_bad_player_like_name(name):
-                debug_rejected_name += 1
-                continue
-            if not is_likely_wnba_name_dynamic(name, combined, dynamic_wnba_names):
+            if not should_accept_underdog_wnba_row(name, combined, dynamic_wnba_names):
                 debug_rejected_name += 1
                 continue
 
@@ -1051,20 +1091,34 @@ def fetch_underdog_wnba_props():
 
         rows = clean_prop_rows(rows)
 
-        # Debug sample: if we found names/lines but rejected all, show dynamic allowlist size and one sample.
+        # Final cleanup: remove known NBA/esports leaks before showing the board.
+        rows = [
+            rr for rr in rows
+            if not is_known_nba_name(rr.get("Player"))
+            and not is_bad_player_like_name(rr.get("Player"))
+        ]
+
+        # Debug sample: if we found names/lines but rejected all, show why.
         if not rows and (debug_market > 0 or debug_name > 0):
             try:
                 sample_text = ""
-                for obj2 in objects[:900]:
+                for obj2 in objects[:1200]:
                     c2 = combine_obj_and_related_text(obj2, idx, depth=1)
                     nm2 = candidate_player_name_from_text_and_related(obj2, idx)
-                    if detect_market(c2) and nm2:
-                        sample_text = f"dynamic_names={len(dynamic_wnba_names)} | sample_name={nm2} | sample_text={c2[:420]}"
+                    mk2 = detect_market(c2)
+                    ln2 = sane_wnba_line(mk2, extract_underdog_line_from_obj_or_related(obj2, idx, market=mk2, combined_text=c2)) if mk2 else None
+                    if mk2 and nm2:
+                        sample_text = (
+                            f"dynamic_names={len(dynamic_wnba_names)} | sample_name={nm2} | "
+                            f"market={mk2} | line={ln2} | bad_name={is_bad_player_like_name(nm2)} | "
+                            f"nba_name={is_known_nba_name(nm2)} | accept={should_accept_underdog_wnba_row(nm2, c2, dynamic_wnba_names)} | "
+                            f"sample_text={c2[:420]}"
+                        )
                         break
                 if sample_text:
                     log_source_request(url, "DEBUG_REJECT_SAMPLE", sample_text)
-            except Exception:
-                pass
+            except Exception as e:
+                log_source_request(url, "DEBUG_REJECT_SAMPLE_ERROR", str(e))
 
         if rows:
             all_rows.extend(rows)
