@@ -19,7 +19,7 @@ import pandas as pd
 import requests
 import streamlit as st
 
-APP_VERSION = "WNBA v2.5 UNDERDOG RELATIONSHIP PARSER"
+APP_VERSION = "WNBA v2.6 UNDERDOG LINE TEXT PARSER"
 
 # =========================
 # STORAGE
@@ -434,39 +434,102 @@ def candidate_player_name_from_text_and_related(obj, idx):
         return good[0]
     return None
 
-def extract_underdog_line_from_obj_or_related(obj, idx, market=None):
-    """Find the numeric prop line from object or related line/option objects."""
+def extract_underdog_line_from_obj_or_related(obj, idx, market=None, combined_text=""):
+    """Find the numeric prop line from object, relationships, or readable text.
+
+    v2.6 fix:
+    Your logs showed market/name counts were positive but line=0. That means
+    Underdog exposed the player and market, but the numeric line was not in the
+    usual numeric JSON keys. This fallback scans related text too.
+    """
     keys = [
         "stat_value", "line_score", "over_under_line", "target_value", "line",
-        "value", "over_under", "total", "points", "line_value"
+        "value", "over_under", "total", "points", "line_value", "display_value",
+        "option_line", "projection", "projected_value", "stat_line", "line_display"
     ]
 
-    def scan(o):
+    def scan_numeric_keys(o):
         if not isinstance(o, dict):
             return None
         a = ud_attrs(o)
         for k in keys:
             f = safe_float(a.get(k))
-            if f is not None:
-                return f
+            if sane_wnba_line(market, f) is not None:
+                return float(f)
         return None
 
-    line = scan(obj)
+    # 1) Numeric keys on object.
+    line = scan_numeric_keys(obj)
     if line is not None:
         return line
 
+    # 2) Numeric keys on related objects.
     for ref in relationship_refs(obj):
         ro = idx.get(ref) or idx.get(("", ref[1]))
-        line = scan(ro)
+        line = scan_numeric_keys(ro)
         if line is not None:
             return line
         if isinstance(ro, dict):
             for ref2 in relationship_refs(ro):
                 ro2 = idx.get(ref2) or idx.get(("", ref2[1]))
-                line = scan(ro2)
+                line = scan_numeric_keys(ro2)
                 if line is not None:
                     return line
-    return None
+
+    # 3) Regex scan on combined object + related text.
+    text_blob = str(combined_text or "")
+    if not text_blob:
+        try:
+            text_blob = json.dumps(obj, default=str)
+        except Exception:
+            text_blob = ""
+
+    raw_candidates = []
+
+    # Prefer numbers near market words.
+    market_words = {
+        "points": r"(points|pts)",
+        "rebounds": r"(rebounds|rebs|reb)",
+        "assists": r"(assists|asts|ast)",
+        "pts_rebs_asts": r"(pra|points\s*\+\s*rebounds\s*\+\s*assists|pts\s*\+\s*rebs\s*\+\s*asts)",
+        "pts_rebs": r"(points\s*\+\s*rebounds|pts\s*\+\s*rebs)",
+        "pts_asts": r"(points\s*\+\s*assists|pts\s*\+\s*asts)",
+        "rebs_asts": r"(rebounds\s*\+\s*assists|rebs\s*\+\s*asts)",
+        "threes": r"(3\s*pt|3pt|3pm|three|threes|3-pointers)",
+        "steals": r"(steals|stls|stl)",
+        "blocks": r"(blocks|blks|blk)",
+    }
+
+    mw = market_words.get(market, r"(points|rebounds|assists)")
+    patterns = [
+        rf"(?i)(\d{{1,2}}(?:\.5|\.0)?)\s*(?:{mw})",
+        rf"(?i)(?:{mw})\D{{0,30}}(\d{{1,2}}(?:\.5|\.0)?)",
+        r"(?<!\d)(\d{1,2}\.5)(?!\d)",
+        r"(?<!\d)(\d{1,2}\.0)(?!\d)",
+    ]
+
+    for pat in patterns:
+        for m in re.findall(pat, text_blob):
+            if isinstance(m, tuple):
+                m = next((x for x in m if x and re.search(r"\d", x)), "")
+            f = safe_float(m)
+            if sane_wnba_line(market, f) is not None:
+                raw_candidates.append(float(f))
+
+    if not raw_candidates:
+        return None
+
+    vals = sorted(set(raw_candidates))
+
+    # Avoid selecting tiny unrelated numbers for points/combo markets if better high values exist.
+    if market == "points":
+        high = [v for v in vals if v >= 5.5]
+        vals = high or vals
+    elif market in ["pts_rebs_asts", "pts_rebs", "pts_asts"]:
+        high = [v for v in vals if v >= 8.5]
+        vals = high or vals
+
+    return float(vals[len(vals)//2])
 
 def sane_wnba_line(market, line):
     line = safe_float(line)
@@ -712,7 +775,7 @@ def fetch_underdog_wnba_props():
                 continue
             debug_name += 1
 
-            raw_line = extract_underdog_line_from_obj_or_related(obj, idx, market=market)
+            raw_line = extract_underdog_line_from_obj_or_related(obj, idx, market=market, combined_text=combined)
             line = sane_wnba_line(market, raw_line)
             if line is None:
                 continue
@@ -742,6 +805,21 @@ def fetch_underdog_wnba_props():
             })
 
         rows = clean_prop_rows(rows)
+
+        # Debug sample: if we found markets/names but no lines, store a tiny clue.
+        if not rows and debug_name > 0:
+            try:
+                sample_text = ""
+                for obj2 in objects[:400]:
+                    c2 = combine_obj_and_related_text(obj2, idx, depth=1)
+                    if detect_market(c2) and candidate_player_name_from_text_and_related(obj2, idx):
+                        sample_text = c2[:350]
+                        break
+                if sample_text:
+                    log_source_request(url, "DEBUG_NO_LINE_SAMPLE", sample_text)
+            except Exception:
+                pass
+
         if rows:
             all_rows.extend(rows)
             log_source_request(
@@ -1191,7 +1269,7 @@ if board_df.empty:
     <div class="red-card">
     <b>No WNBA prop lines loaded yet.</b><br>
     Click Refresh / Load Board. If it still shows this, Underdog/PrizePicks did not return WNBA props or blocked the request.
-    The app will not create fake lines. Try Board filter = All Lines because some sources post tomorrow props without a readable date.
+    The app will not create fake lines. Keep Board filter = All Lines. If logs show market/name positive but line=0, use v2.6+ because Underdog moved lines into text/related fields.
     </div>
     """, unsafe_allow_html=True)
 else:
