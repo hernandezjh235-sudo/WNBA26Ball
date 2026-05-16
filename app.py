@@ -19,7 +19,7 @@ import pandas as pd
 import requests
 import streamlit as st
 
-APP_VERSION = "WNBA v3.1 ACCEPT VALID WNBA ROWS"
+APP_VERSION = "WNBA v3.2 VERIFIED WNBA ONLY"
 
 # =========================
 # STORAGE
@@ -700,12 +700,30 @@ WNBA_NAME_ALLOW_HINTS = {
     "natalie achonwa", "elizabeth williams", "moriah jefferson",
 }
 
+# Extra WNBA names added for stricter verified WNBA filtering.
+WNBA_NAME_ALLOW_HINTS.update({
+    "aerial powers", "alexis morris", "alissa pili", "aliyah edwards",
+    "laeticia amihere", "ariel atkins", "brianna turner", "bridget carleton",
+    "carla leite", "celeste taylor", "charisma osborne", "courtney vandersloot",
+    "danielle robinson", "dorka juhasz", "emily engstler", "ezi magbegor",
+    "haley jones", "iliana rupert", "isabelle harrison", "jacy sheldon",
+    "jade melbourne", "janelle salaun", "jessika carter", "jordan horston",
+    "joyner holmes", "julie allemand", "kayla thornton", "kia nurse",
+    "kierstan bell", "lauren cox", "lindsay allen", "liatu king",
+    "michaela onyenwere", "morgan bertsch", "nia coffey", "nia clouden",
+    "odyssey sims", "olivia nelson ododa", "olivia miles", "rachael banham",
+    "rebecca allen", "sam thomas", "sami whitcomb", "shatori walker kimbrough",
+    "sika kone", "sydney colson", "tiffany hayes", "veronica burton",
+    "victoria vivians", "zoe brooks"
+})
+
+
 def is_known_nba_name(name):
     n = normalize_name(name)
     if n in NBA_NAME_BLOCKLIST:
         return True
     # Obvious NBA-only surname protections for unique names.
-    nba_unique_tokens = ["wembanyama", "jokic", "doncic", "gilgeous", "antetokounmpo"]
+    nba_unique_tokens = ["wembanyama", "jokic", "doncic", "gilgeous", "antetokounmpo", "mitchell"]
     return any(tok in n for tok in nba_unique_tokens)
 
 def is_likely_wnba_name(name, combined_text=""):
@@ -779,127 +797,6 @@ def is_likely_wnba_name_dynamic(name, combined_text="", dynamic_names=None):
     return False
 
 
-def should_accept_underdog_wnba_row(name, combined_text="", dynamic_names=None):
-    """Final guard for Underdog rows.
-
-    v3.1 fix:
-    Logs showed: name > 0, line > 0, rejected_name == line.
-    That means valid rows reached the final guard but were rejected because the
-    WNBA allowlist was too strict. This accepts valid-looking player names as long
-    as they do not look like NBA/esports/event/team rows.
-    """
-    if is_bad_player_like_name(name):
-        return False
-    if is_known_nba_name(name):
-        return False
-
-    n = normalize_name(name)
-    raw = " " + str(combined_text or "").lower() + " "
-
-    # Hard wrong-sport/event blocks.
-    if any(x in raw for x in [
-        " dota", "esports", "counter-strike", " cs2", "valorant",
-        "league of legends", "natus vincere", "xtreme gaming"
-    ]):
-        return False
-    if object_mentions_other_basketball_league(raw):
-        return False
-
-    # Strong WNBA evidence.
-    if n in WNBA_NAME_ALLOW_HINTS:
-        return True
-    if dynamic_names and n in dynamic_names:
-        return True
-    if " wnba" in raw or " women" in raw or " women's" in raw or "basketball_wnba" in raw:
-        return True
-
-    # Soft fallback: if the payload relationship already passed WNBA checks and
-    # name looks like a real person, accept it unless it is a known NBA name.
-    # This is necessary because Underdog sometimes separates sport/league from player rows.
-    if 2 <= len(str(name).split()) <= 4:
-        return True
-
-    return False
-
-def underdog_text_is_wnba(text, payload_has_wnba=False):
-    raw = " " + str(text or "").lower() + " "
-
-    # Hard block obvious wrong sports even if the full Underdog payload has WNBA elsewhere.
-    if has_bad_cross_sport_terms(raw):
-        return False
-    if object_mentions_other_basketball_league(raw):
-        return False
-    if any(x in raw for x in [" wembanyama", " lebron ", " doncic", " jokic", " gilgeous", " curry"]):
-        return False
-
-    # Strong accept when the related object chain itself says WNBA/women.
-    if " wnba" in raw or " women" in raw or " women's" in raw or "basketball_wnba" in raw:
-        return True
-
-    # Payload-only fallback is allowed only later if the recovered name is WNBA allowlisted.
-    if payload_has_wnba:
-        basketball_markers = [" points", " rebounds", " assists", " pts", " rebs", " asts", " 3pt", "3pm"]
-        return any(x in raw for x in basketball_markers)
-
-    return False
-
-
-# =========================
-# BETTING MATH
-# =========================
-def decimal_odds(odds):
-    odds = safe_float(odds)
-    if odds is None:
-        return None
-    return 1 + odds / 100 if odds > 0 else 1 + 100 / abs(odds)
-
-def expected_value(prob, odds=-110):
-    dec = decimal_odds(odds)
-    if prob is None or dec is None:
-        return None
-    return (prob * (dec - 1)) - (1 - prob)
-
-def kelly_fraction(prob, odds=-110):
-    dec = decimal_odds(odds)
-    if prob is None or dec is None:
-        return 0.0
-    b = dec - 1
-    q = 1 - prob
-    if b <= 0:
-        return 0.0
-    return float(clamp(((b * prob) - q) / b, 0, 0.25))
-
-def normal_side_probability(proj, line, std, side):
-    proj = safe_float(proj)
-    line = safe_float(line)
-    std = max(safe_float(std, 1.0) or 1.0, 0.35)
-    if proj is None or line is None:
-        return None
-    z = (line - proj) / std
-    cdf = 0.5 * (1 + math.erf(z / math.sqrt(2)))
-    return float(clamp(1 - cdf if side == "OVER" else cdf, 0.001, 0.999))
-
-# =========================
-# STATS — SAFE OPTIONAL
-# =========================
-def nba_stats_headers():
-    return {
-        "Host": "stats.nba.com",
-        "Connection": "keep-alive",
-        "Accept": "application/json, text/plain, */*",
-        "x-nba-stats-token": "true",
-        "User-Agent": "Mozilla/5.0",
-        "x-nba-stats-origin": "stats",
-        "Origin": "https://www.wnba.com",
-        "Referer": "https://www.wnba.com/",
-    }
-
-def stats_df_from_result(data, idx=0):
-    try:
-        result = data["resultSets"][idx]
-        return pd.DataFrame(result["rowSet"], columns=result["headers"])
-    except Exception:
-        return pd.DataFrame()
 
 @st.cache_data(ttl=1800, show_spinner=False)
 def get_wnba_player_dashboard(season="2025", last_n="0"):
@@ -1005,6 +902,36 @@ def clean_prop_rows(rows):
         out.append(r)
     return out
 
+
+def should_accept_underdog_wnba_row(name, combined_text="", dynamic_names=None):
+    """Strict WNBA-only final guard v3.2.
+
+    Accept only explicit/dynamic/static WNBA names. No generic basketball fallback.
+    """
+    if is_bad_player_like_name(name):
+        return False
+    if is_known_nba_name(name):
+        return False
+
+    n = normalize_name(name)
+    raw = " " + str(combined_text or "").lower() + " "
+
+    if any(x in raw for x in [
+        " dota", "esports", "counter-strike", " cs2", "valorant",
+        "league of legends", "natus vincere", "xtreme gaming",
+        " nba", "basketball_nba", " men basketball", " mens basketball"
+    ]):
+        return False
+
+    if n in WNBA_NAME_ALLOW_HINTS:
+        return True
+    if dynamic_names and n in dynamic_names:
+        return True
+    if " wnba" in raw or " women's" in raw or " women " in raw or "basketball_wnba" in raw:
+        return True
+
+    return False
+
 @st.cache_data(ttl=120, show_spinner=False)
 def fetch_underdog_wnba_props():
     """Relationship-aware Underdog WNBA parser.
@@ -1096,6 +1023,7 @@ def fetch_underdog_wnba_props():
             rr for rr in rows
             if not is_known_nba_name(rr.get("Player"))
             and not is_bad_player_like_name(rr.get("Player"))
+            and should_accept_underdog_wnba_row(rr.get("Player"), rr.get("Raw Market", ""), dynamic_wnba_names)
         ]
 
         # Debug sample: if we found names/lines but rejected all, show why.
