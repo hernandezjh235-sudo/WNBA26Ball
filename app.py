@@ -19,7 +19,7 @@ import pandas as pd
 import requests
 import streamlit as st
 
-APP_VERSION = "WNBA v3.2 VERIFIED WNBA ONLY"
+APP_VERSION = "WNBA v3.3 NAMEERROR FIX"
 
 # =========================
 # STORAGE
@@ -929,6 +929,35 @@ def should_accept_underdog_wnba_row(name, combined_text="", dynamic_names=None):
         return True
     if " wnba" in raw or " women's" in raw or " women " in raw or "basketball_wnba" in raw:
         return True
+
+    return False
+
+
+def underdog_text_is_wnba(text, payload_has_wnba=False):
+    """WNBA sport filter used before final player-name guard.
+
+    Keeps obvious wrong sports/NBA rows out, while allowing Underdog's nested
+    WNBA rows to continue to the stricter final WNBA player-name guard.
+    """
+    raw = " " + str(text or "").lower() + " "
+
+    if has_bad_cross_sport_terms(raw):
+        return False
+    if object_mentions_other_basketball_league(raw):
+        return False
+    if any(x in raw for x in [
+        " wembanyama", " donovan mitchell", " lebron ", " doncic",
+        " jokic", " gilgeous", " curry", " antetokounmpo"
+    ]):
+        return False
+
+    if " wnba" in raw or " women's" in raw or " women " in raw or "basketball_wnba" in raw:
+        return True
+
+    # Let payload-level WNBA rows pass only to the strict final guard.
+    if payload_has_wnba:
+        basketball_markers = [" points", " rebounds", " assists", " pts", " rebs", " asts", " 3pt", "3pm", " steals", " blocks"]
+        return any(x in raw for x in basketball_markers)
 
     return False
 
