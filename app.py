@@ -19,7 +19,7 @@ import pandas as pd
 import requests
 import streamlit as st
 
-APP_VERSION = "WNBA v2.6 UNDERDOG LINE TEXT PARSER"
+APP_VERSION = "WNBA v2.7 WNBA ONLY FILTER + STREAMLIT FIX"
 
 # =========================
 # STORAGE
@@ -274,7 +274,9 @@ def has_bad_cross_sport_terms(text):
         " mlb", " baseball", " pitcher", " strikeout", " strikeouts",
         " nfl", " football", " nhl", " hockey", " soccer", " tennis",
         " golf", " mma", " ufc", " ncaab", " ncaa", " college",
-        " esports", " nascar"
+        " esports", " esport", " nascar", " dota", " dota 2", " counter-strike", " counter strike",
+        " cs2", " csgo", " valorant", " league of legends", " lol esports", " gaming",
+        " natus vincere", " xtreme gaming", " fnatic", " faze", " team liquid"
     ]
     return any(x in raw for x in bad_terms)
 
@@ -422,10 +424,18 @@ def candidate_player_name_from_text_and_related(obj, idx):
         low = cc.lower()
         if detect_market(cc):
             continue
-        if any(x in low for x in ["over", "under", "points", "rebounds", "assists", "fantasy", "wnba", "nba", "vs ", " @ "]):
+        # Reject event/team/match titles. A WNBA player name should not look like
+        # "Dota: Xtreme Gaming vs. Natus Vincere" or "Team A @ Team B".
+        if any(x in low for x in [
+            "over", "under", "points", "rebounds", "assists", "fantasy", "wnba", "nba",
+            " vs ", " vs. ", " @ ", "dota", "gaming", "natus", "vincere", "esports",
+            "counter-strike", "cs2", "valorant", "league of legends"
+        ]):
             continue
-        # must look like a person: at least first + last
-        if len(cc.split()) >= 2:
+        if ":" in cc or "@" in cc:
+            continue
+        # must look like a person: first + last, not a long event title
+        if 2 <= len(cc.split()) <= 4:
             good.append(cc)
 
     if good:
@@ -556,14 +566,24 @@ def sane_wnba_line(market, line):
 
 def underdog_text_is_wnba(text, payload_has_wnba=False):
     raw = " " + str(text or "").lower() + " "
+
+    # Hard block obvious wrong sports even if the full Underdog payload has WNBA elsewhere.
     if has_bad_cross_sport_terms(raw):
         return False
     if object_mentions_other_basketball_league(raw):
         return False
-    if " wnba" in raw or " women" in raw or " women's" in raw:
+
+    # Strong accept when the related object chain itself says WNBA/women.
+    if " wnba" in raw or " women" in raw or " women's" in raw or "basketball_wnba" in raw:
         return True
-    # If the full payload has WNBA, allow relationship-resolved rows that do not spell WNBA themselves.
-    return bool(payload_has_wnba)
+
+    # Payload-only fallback is dangerous. Allow it only when the row looks like a basketball prop
+    # and does not look like an event title/sport row.
+    if payload_has_wnba:
+        basketball_markers = [" points", " rebounds", " assists", " pts", " rebs", " asts", " 3pt", "3pm"]
+        return any(x in raw for x in basketball_markers)
+
+    return False
 
 
 # =========================
@@ -789,6 +809,13 @@ def fetch_underdog_wnba_props():
                 if p is not None and -10000 < p < 10000:
                     price = p
                     break
+
+            # Final WNBA-only safety: reject non-player/event/team titles.
+            name_low = str(name).lower()
+            if any(x in name_low for x in ["dota", "gaming", "natus", "vincere", "esports", " vs ", " vs. ", " @ "]):
+                continue
+            if ":" in str(name) or len(str(name).split()) > 4:
+                continue
 
             rows.append({
                 "Player": name,
@@ -1207,6 +1234,7 @@ st.markdown(f"""
   <span class="badge good-badge">{APP_VERSION}</span>
   <span class="badge blue-badge">Underdog first</span>
   <span class="badge">No fake lines</span>
+  <span class="badge red-badge">WNBA-only sport filter</span>
 </div>
 """, unsafe_allow_html=True)
 
@@ -1328,9 +1356,15 @@ else:
         saved = pd.DataFrame(load_json(PICK_LOG, []))
         clv = pd.DataFrame(load_json(CLV_FILE, {}).values())
         st.subheader("Official saved snapshots")
-        st.dataframe(saved.tail(600), use_container_width=True, height=350) if not saved.empty else st.info("No saved snapshots yet.")
+        if not saved.empty:
+            st.dataframe(saved.tail(600), use_container_width=True, height=350)
+        else:
+            st.info("No saved snapshots yet.")
         st.subheader("CLV tracker")
-        st.dataframe(clv.tail(600), use_container_width=True, height=300) if not clv.empty else st.info("No CLV rows yet.")
+        if not clv.empty:
+            st.dataframe(clv.tail(600), use_container_width=True, height=300)
+        else:
+            st.info("No CLV rows yet.")
 
     with tab_grade:
         with st.form("grade_form"):
@@ -1343,9 +1377,15 @@ else:
             submitted = st.form_submit_button("Grade and update learning")
             if submitted:
                 n = save_grade(g_player, inv_market[g_market_label], g_line, g_actual, g_source or None)
-                st.success(f"Graded {n} saved snapshot(s).") if n else st.warning("No matching saved snapshot found.")
+                if n:
+                    st.success(f"Graded {n} saved snapshot(s).")
+                else:
+                    st.warning("No matching saved snapshot found.")
         results = pd.DataFrame(load_json(RESULT_LOG, []))
-        st.dataframe(results.tail(600), use_container_width=True, height=360) if not results.empty else st.info("No graded results yet.")
+        if not results.empty:
+            st.dataframe(results.tail(600), use_container_width=True, height=360)
+        else:
+            st.info("No graded results yet.")
 
     with tab_learning:
         learn = load_json(LEARN_FILE, {})
