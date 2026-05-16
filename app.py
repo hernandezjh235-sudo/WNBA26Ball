@@ -19,7 +19,7 @@ import pandas as pd
 import requests
 import streamlit as st
 
-APP_VERSION = "WNBA v2.2 STREAMLIT ERROR FIX"
+APP_VERSION = "WNBA v2.4 UNDERDOG RELAXED PARSER"
 
 # =========================
 # STORAGE
@@ -230,6 +230,62 @@ def flatten_json(obj):
             items.extend(flatten_json(x))
     return items
 
+def parse_prop_date_from_text_or_obj(obj):
+    """Best-effort date extraction from prop-feed rows.
+
+    Many public Underdog rows do not expose a clean game date field. If we cannot
+    read a date, we keep the line visible on All Lines instead of hiding it.
+    """
+    if not isinstance(obj, dict):
+        return None
+    keys = [
+        "scheduled_at", "starts_at", "start_time", "game_date", "date",
+        "match_date", "commence_time", "event_time", "game_time"
+    ]
+    for k in keys:
+        v = obj.get(k)
+        if isinstance(v, str) and len(v) >= 8:
+            try:
+                # Handles 2026-05-17, 2026-05-17T00:00:00Z, etc.
+                return v[:10]
+            except Exception:
+                pass
+    try:
+        blob = json.dumps(obj, default=str)
+        m = re.search(r"(20\d{2}-\d{2}-\d{2})", blob)
+        if m:
+            return m.group(1)
+    except Exception:
+        pass
+    return None
+
+def day_label_from_date(prop_date):
+    if prop_date == today_str():
+        return "Today"
+    if prop_date == tomorrow_str():
+        return "Tomorrow"
+    if prop_date:
+        return prop_date
+    return "Unknown"
+
+def has_bad_cross_sport_terms(text):
+    raw = " " + str(text or "").lower() + " "
+    bad_terms = [
+        " mlb", " baseball", " pitcher", " strikeout", " strikeouts",
+        " nfl", " football", " nhl", " hockey", " soccer", " tennis",
+        " golf", " mma", " ufc", " ncaab", " ncaa", " college",
+        " esports", " nascar"
+    ]
+    return any(x in raw for x in bad_terms)
+
+def object_mentions_other_basketball_league(text):
+    raw = " " + str(text or "").lower() + " "
+    # NBA rows sometimes say NBA explicitly. Block those unless the same object also says WNBA.
+    if " wnba" in raw or " women" in raw or " women's" in raw:
+        return False
+    return " nba" in raw or " basketball_nba" in raw or " mens basketball" in raw or " men basketball" in raw
+
+
 # =========================
 # BETTING MATH
 # =========================
@@ -393,56 +449,105 @@ def clean_prop_rows(rows):
 
 @st.cache_data(ttl=120, show_spinner=False)
 def fetch_underdog_wnba_props():
+    """Parse Underdog WNBA prop rows.
+
+    v2.4 fix: Underdog sometimes stores league/sport info away from the exact
+    over_under object. The older parser required every flattened object to say
+    WNBA, which hid posted tomorrow lines. This parser first tries strict WNBA
+    object matches, then a safer relaxed pass that only activates if the full
+    payload contains WNBA and the row has player + supported market + real line.
+    """
     all_rows = []
+    debug_counts = []
+
     for url in UNDERDOG_URLS:
-        data = safe_get_json(url, timeout=8)
+        data = safe_get_json(url, timeout=10)
         if not data:
+            debug_counts.append(f"{url}: no json")
             continue
-        for obj in flatten_json(data):
+
+        payload_text = json.dumps(data, default=str).lower()
+        payload_has_wnba = ("wnba" in payload_text) or ("women" in payload_text) or ("women's" in payload_text)
+        objects = flatten_json(data)
+        strict_rows = []
+        relaxed_rows = []
+
+        for obj in objects:
             if not isinstance(obj, dict):
                 continue
+
             text_blob = json.dumps(obj, default=str).lower()
-            if "wnba" not in text_blob and "women" not in text_blob:
+            if has_bad_cross_sport_terms(text_blob) or object_mentions_other_basketball_league(text_blob):
                 continue
-            market_text = " ".join(str(obj.get(k, "")) for k in ["over_under", "over_under_title", "stat_type", "stat", "title", "appearance_stat", "display_stat", "option_display"])
+
+            obj_has_wnba = ("wnba" in text_blob) or ("women" in text_blob) or ("women's" in text_blob)
+            if not obj_has_wnba and not payload_has_wnba:
+                continue
+
+            market_text = " ".join(str(obj.get(k, "")) for k in [
+                "over_under", "over_under_title", "stat_type", "stat", "title",
+                "appearance_stat", "display_stat", "option_display", "market", "market_name",
+                "name", "description"
+            ])
             market = detect_market(market_text) or detect_market(text_blob)
             if market is None:
                 continue
 
             name = None
-            for k in ["player_name", "athlete_name", "title", "name", "full_name"]:
+            for k in ["player_name", "athlete_name", "title", "name", "full_name", "display_name"]:
                 val = obj.get(k)
                 if isinstance(val, str) and len(val.split()) >= 2 and not detect_market(val):
                     name = val
                     break
+
             if not name:
-                for k in ["player", "athlete", "appearance"]:
+                for k in ["player", "athlete", "appearance", "participant"]:
                     nested = obj.get(k)
                     if isinstance(nested, dict):
-                        for nk in ["name", "full_name", "display_name", "player_name"]:
+                        for nk in ["name", "full_name", "display_name", "player_name", "title"]:
                             val = nested.get(nk)
-                            if isinstance(val, str) and len(val.split()) >= 2:
+                            if isinstance(val, str) and len(val.split()) >= 2 and not detect_market(val):
                                 name = val
                                 break
                     if name:
                         break
+
             line = extract_number_line(obj)
             if not name or line is None:
                 continue
+
+            # Guard against weird metadata numbers. Main WNBA props should be half or whole numbers in a sane range.
+            if line < 0.5 or line > 80:
+                continue
+
             price = safe_float(obj.get("american_price"), -110) or -110
-            all_rows.append({
+            prop_date = parse_prop_date_from_text_or_obj(obj)
+            row = {
                 "Player": name,
                 "Market": market,
                 "Market Label": MARKET_LABELS.get(market, market),
-                "Line": line,
+                "Line": float(line),
                 "Source": "Underdog",
                 "Price": price,
                 "Raw Market": market_text[:140],
                 "Real Line": True,
-            })
-        if all_rows:
-            log_source_request(url, "OK", f"{len(all_rows)} WNBA props parsed")
+                "Prop Date": prop_date,
+                "Game Day": day_label_from_date(prop_date),
+                "Parser Mode": "strict-object-wnba" if obj_has_wnba else "relaxed-payload-wnba",
+            }
+            if obj_has_wnba:
+                strict_rows.append(row)
+            else:
+                relaxed_rows.append(row)
+
+        chosen = strict_rows if strict_rows else relaxed_rows
+        if chosen:
+            all_rows.extend(chosen)
+            log_source_request(url, "OK", f"{len(chosen)} WNBA props parsed ({'strict' if strict_rows else 'relaxed'})")
             break
+        else:
+            log_source_request(url, "OK_NO_WNBA_ROWS", f"payload_has_wnba={payload_has_wnba}, objects={len(objects)}")
+
     return clean_prop_rows(all_rows)
 
 @st.cache_data(ttl=180, show_spinner=False)
@@ -476,7 +581,18 @@ def fetch_prizepicks_wnba_props():
             except Exception:
                 pass
         if player_name:
-            rows.append({"Player": player_name, "Market": market, "Market Label": MARKET_LABELS.get(market, market), "Line": line, "Source": "PrizePicks", "Price": -110, "Raw Market": str(attrs.get("stat_type", ""))[:140], "Real Line": True})
+            rows.append({
+                "Player": player_name,
+                "Market": market,
+                "Market Label": MARKET_LABELS.get(market, market),
+                "Line": line,
+                "Source": "PrizePicks",
+                "Price": -110,
+                "Raw Market": str(attrs.get("stat_type", ""))[:140],
+                "Real Line": True,
+                "Prop Date": parse_prop_date_from_text_or_obj(item),
+                "Game Day": day_label_from_date(parse_prop_date_from_text_or_obj(item)),
+            })
     return clean_prop_rows(rows)
 
 def fetch_all_real_wnba_props(source_choice):
@@ -669,6 +785,8 @@ def build_board(prop_rows, season_df, last5_df, last10_df):
             "Player": r["Player"],
             "Market": r["Market"],
             "Market Label": r.get("Market Label", MARKET_LABELS.get(r["Market"], r["Market"])),
+            "Game Day": r.get("Game Day", "Unknown"),
+            "Prop Date": r.get("Prop Date"),
             "Line": line,
             "Projection": round(proj, 2),
             "Edge": round(proj - line, 2),
@@ -773,7 +891,7 @@ def render_player_cards(df, max_cards=200):
             <div style="display:flex;justify-content:space-between;gap:12px;align-items:flex-start;">
                 <div>
                     <div style="font-size:23px;font-weight:950;">{row['Player']}</div>
-                    <div class="small-muted">{row['Market Label']} • {row['Source']} • Price {row['Price']}</div>
+                    <div class="small-muted">{row.get('Game Day', 'Unknown')} • {row['Market Label']} • {row['Source']} • Price {row['Price']}</div>
                 </div>
                 <div><span class="badge {badge}">{sig}</span></div>
             </div>
@@ -809,7 +927,7 @@ with st.sidebar:
     source_choice = st.selectbox("Line source", ["Underdog first", "Underdog only", "PrizePicks backup only", "All available"], index=0)
     season = st.text_input("WNBA season", value=os.getenv("WNBA_SEASON", "2025"))
     load_stats = st.checkbox("Use WNBA stats endpoint for projections", value=True)
-    selected_day = st.radio("Game tab", ["Today", "Tomorrow"], horizontal=True)
+    selected_day = st.radio("Board filter", ["All Lines", "Today", "Tomorrow"], horizontal=True)
     st.divider()
     st.caption("Filters")
     selected_markets = st.multiselect("Markets", list(MARKET_LABELS.values()), default=list(MARKET_LABELS.values()))
@@ -863,11 +981,21 @@ if board_df.empty:
     <div class="red-card">
     <b>No WNBA prop lines loaded yet.</b><br>
     Click Refresh / Load Board. If it still shows this, Underdog/PrizePicks did not return WNBA props or blocked the request.
-    The app will not create fake lines.
+    The app will not create fake lines. Try Board filter = All Lines because some sources post tomorrow props without a readable date.
     </div>
     """, unsafe_allow_html=True)
 else:
     filt = board_df.copy()
+
+    # Day filter fix:
+    # Keep All Lines as the default because some real prop sources do not expose a usable game date.
+    # Today/Tomorrow only filters rows that have a matching Game Day; Unknown rows are still shown
+    # so posted Underdog lines do not disappear just because the schedule endpoint timed out.
+    if selected_day in ["Today", "Tomorrow"] and "Game Day" in filt.columns:
+        known_match = filt[filt["Game Day"].astype(str) == selected_day]
+        unknown_rows = filt[filt["Game Day"].astype(str).isin(["Unknown", "", "None", "nan"])]
+        filt = pd.concat([known_match, unknown_rows], ignore_index=True)
+
     if selected_markets:
         filt = filt[filt["Market Label"].isin(selected_markets)]
     if signal_filter:
@@ -877,7 +1005,7 @@ else:
 
     c1, c2, c3, c4, c5, c6 = st.columns(6)
     c1.metric("Props shown", len(filt))
-    c2.metric("Real props pulled", len(board_df))
+    c2.metric("Board filter", selected_day)
     c3.metric("Elite", int((filt["Signal"] == "ELITE WATCH").sum()))
     c4.metric("Pass", int((filt["Signal"] == "PASS").sum()))
     c5.metric("Lean", int((filt["Signal"] == "LEAN").sum()))
@@ -894,9 +1022,10 @@ else:
         render_player_cards(filt, max_cards=max_cards)
 
     with tab_table:
-        cols = ["Player", "Market Label", "Line", "Projection", "Edge", "Pick", "Fair Prob", "EV", "Kelly", "Data Score", "Signal", "Source", "CLV Δ", "Line Δ", "Risk Notes"]
-        st.dataframe(filt[cols], use_container_width=True, height=740)
-        st.download_button("Download board CSV", filt[cols].to_csv(index=False).encode("utf-8"), "wnba_board.csv", "text/csv")
+        cols = ["Player", "Game Day", "Prop Date", "Market Label", "Line", "Projection", "Edge", "Pick", "Fair Prob", "EV", "Kelly", "Data Score", "Signal", "Source", "CLV Δ", "Line Δ", "Risk Notes", "Projection Notes"]
+        safe_cols = [c for c in cols if c in filt.columns]
+        st.dataframe(filt[safe_cols], use_container_width=True, height=740)
+        st.download_button("Download board CSV", filt[safe_cols].to_csv(index=False).encode("utf-8"), "wnba_board.csv", "text/csv")
 
     with tab_games:
         g1, g2 = st.columns(2)
