@@ -19,7 +19,7 @@ import pandas as pd
 import requests
 import streamlit as st
 
-APP_VERSION = "WNBA v2.7 WNBA ONLY FILTER + STREAMLIT FIX"
+APP_VERSION = "WNBA v2.8 TITLE NAME PARSER"
 
 # =========================
 # STORAGE
@@ -386,27 +386,43 @@ def combine_obj_and_related_text(obj, idx, depth=2):
     return " | ".join(parts)
 
 def candidate_player_name_from_text_and_related(obj, idx):
-    """Find a real player/athlete name from object or relationships."""
+    """Find a WNBA player name from direct player fields or market titles.
+
+    v2.8 fix:
+    Your logs showed market > 0 but name = 0. Underdog often stores names as
+    titles like 'Aja Wilson Points'. Earlier versions rejected those because
+    they contained market words. This version strips the market words and keeps
+    the player name.
+    """
     candidates = []
-    checked = []
 
     def add_from(o):
         if not isinstance(o, dict):
             return
-        checked.append(o)
         a = ud_attrs(o)
-        for k in [
-            "player_name", "athlete_name", "full_name", "display_name", "name",
-            "title", "first_name", "last_name", "abbr_name", "short_name"
-        ]:
-            v = a.get(k)
-            if isinstance(v, str) and len(v.strip()) >= 3:
-                candidates.append(v.strip())
-        # Join first/last when split
+
+        # First/last is strongest.
         fn = a.get("first_name")
         ln = a.get("last_name")
         if isinstance(fn, str) and isinstance(ln, str):
             candidates.append((fn + " " + ln).strip())
+
+        # Direct name fields.
+        for k in [
+            "player_name", "athlete_name", "full_name", "display_name",
+            "name", "abbr_name", "short_name"
+        ]:
+            v = a.get(k)
+            if isinstance(v, str) and len(v.strip()) >= 3:
+                candidates.append(v.strip())
+
+        # Title fields that may include market name.
+        for k in ["title", "display_title", "description", "over_under_title", "option_display"]:
+            v = a.get(k)
+            if isinstance(v, str):
+                cleaned = strip_market_words_from_title(v)
+                if cleaned:
+                    candidates.append(cleaned)
 
     add_from(obj)
     for ref in relationship_refs(obj):
@@ -417,31 +433,31 @@ def candidate_player_name_from_text_and_related(obj, idx):
                 ro2 = idx.get(ref2) or idx.get(("", ref2[1]))
                 add_from(ro2)
 
-    # Filter out market names and team/event titles.
+    # Extra fallback: parse all related titles.
+    tc = title_candidates_from_obj_and_related(obj, idx)
+    if tc:
+        candidates.append(tc)
+
     good = []
     for c in candidates:
-        cc = c.strip()
-        low = cc.lower()
-        if detect_market(cc):
+        cc = str(c or "").strip()
+        if not cc:
             continue
-        # Reject event/team/match titles. A WNBA player name should not look like
-        # "Dota: Xtreme Gaming vs. Natus Vincere" or "Team A @ Team B".
-        if any(x in low for x in [
-            "over", "under", "points", "rebounds", "assists", "fantasy", "wnba", "nba",
-            " vs ", " vs. ", " @ ", "dota", "gaming", "natus", "vincere", "esports",
-            "counter-strike", "cs2", "valorant", "league of legends"
-        ]):
+
+        # If direct field still has market words, strip them before rejecting.
+        cleaned = strip_market_words_from_title(cc) or cc
+        if is_bad_player_like_name(cleaned):
             continue
-        if ":" in cc or "@" in cc:
+
+        # Avoid obvious generic market/team labels.
+        low = cleaned.lower()
+        if low in ["points", "rebounds", "assists", "steals", "blocks", "wnba"]:
             continue
-        # must look like a person: first + last, not a long event title
-        if 2 <= len(cc.split()) <= 4:
-            good.append(cc)
+
+        good.append(cleaned)
 
     if good:
-        # prefer shortest clean full name, not a huge title
-        good = sorted(set(good), key=lambda x: (len(x), x))
-        return good[0]
+        return sorted(set(good), key=lambda x: (len(x), x))[0]
     return None
 
 def extract_underdog_line_from_obj_or_related(obj, idx, market=None, combined_text=""):
@@ -563,6 +579,88 @@ def sane_wnba_line(market, line):
         return None
     # Props can be whole on fantasy apps sometimes, but most are half. Allow both.
     return float(line)
+
+
+def strip_market_words_from_title(title):
+    """Turn titles like 'A'ja Wilson Points' into 'A'ja Wilson'."""
+    if not isinstance(title, str):
+        return None
+    s = title.strip()
+    if not s:
+        return None
+
+    # Remove common sportsbook separators/details.
+    s = re.sub(r"(?i)\b(higher|lower|over|under|than|more|less)\b", " ", s)
+    s = re.sub(r"(?i)\b(line|projection|fantasy score|stat)\b", " ", s)
+
+    market_phrases = [
+        "points + rebounds + assists", "pts + rebs + asts", "pts+rebs+asts",
+        "points + rebounds", "pts + rebs", "pts+rebs",
+        "points + assists", "pts + asts", "pts+asts",
+        "rebounds + assists", "rebs + asts", "rebs+asts",
+        "3-pointers made", "3 pointers made", "three pointers made",
+        "made threes", "three pointers", "3pt made", "3pm",
+        "points", "pts", "rebounds", "rebs", "reb", "assists", "asts", "ast",
+        "steals", "stls", "stl", "blocks", "blks", "blk", "pra"
+    ]
+    for phrase in sorted(market_phrases, key=len, reverse=True):
+        s = re.sub(r"(?i)\b" + re.escape(phrase).replace("\\ ", r"\s*") + r"\b", " ", s)
+
+    # Remove line numbers from the title.
+    s = re.sub(r"(?<!\d)\d{1,2}(?:\.5|\.0)?(?!\d)", " ", s)
+
+    # Remove team/event pieces.
+    s = re.split(r"(?i)\s+(?:vs\.?|@)\s+", s)[0]
+    s = s.replace(":", " ")
+    s = " ".join(s.split()).strip(" -|•")
+
+    # Must look like a player name.
+    if 2 <= len(s.split()) <= 4:
+        bad = s.lower()
+        if not any(x in bad for x in ["dota", "gaming", "esports", "team ", " vs ", " @ ", "natus", "vincere"]):
+            return s
+    return None
+
+def title_candidates_from_obj_and_related(obj, idx):
+    candidates = []
+
+    def pull(o):
+        if not isinstance(o, dict):
+            return
+        a = ud_attrs(o)
+        for k in [
+            "title", "display_title", "name", "display_name", "description",
+            "over_under_title", "option_display", "appearance_stat"
+        ]:
+            v = a.get(k)
+            if isinstance(v, str):
+                cleaned = strip_market_words_from_title(v)
+                if cleaned:
+                    candidates.append(cleaned)
+
+    pull(obj)
+    for ref in relationship_refs(obj):
+        ro = idx.get(ref) or idx.get(("", ref[1]))
+        pull(ro)
+        if isinstance(ro, dict):
+            for ref2 in relationship_refs(ro):
+                ro2 = idx.get(ref2) or idx.get(("", ref2[1]))
+                pull(ro2)
+
+    if candidates:
+        return sorted(set(candidates), key=lambda x: (len(x), x))[0]
+    return None
+
+def is_bad_player_like_name(name):
+    low = str(name or "").lower()
+    if any(x in low for x in [
+        "dota", "gaming", "natus", "vincere", "esports", "counter-strike",
+        "cs2", "valorant", "league of legends", " vs ", " vs. ", " @ "
+    ]):
+        return True
+    if ":" in str(name) or len(str(name).split()) > 4 or len(str(name).split()) < 2:
+        return True
+    return False
 
 def underdog_text_is_wnba(text, payload_has_wnba=False):
     raw = " " + str(text or "").lower() + " "
@@ -811,10 +909,7 @@ def fetch_underdog_wnba_props():
                     break
 
             # Final WNBA-only safety: reject non-player/event/team titles.
-            name_low = str(name).lower()
-            if any(x in name_low for x in ["dota", "gaming", "natus", "vincere", "esports", " vs ", " vs. ", " @ "]):
-                continue
-            if ":" in str(name) or len(str(name).split()) > 4:
+            if is_bad_player_like_name(name):
                 continue
 
             rows.append({
@@ -833,17 +928,17 @@ def fetch_underdog_wnba_props():
 
         rows = clean_prop_rows(rows)
 
-        # Debug sample: if we found markets/names but no lines, store a tiny clue.
-        if not rows and debug_name > 0:
+        # Debug sample: if we found markets but no names/lines, store a tiny clue.
+        if not rows and (debug_market > 0 or debug_name > 0):
             try:
                 sample_text = ""
-                for obj2 in objects[:400]:
+                for obj2 in objects[:600]:
                     c2 = combine_obj_and_related_text(obj2, idx, depth=1)
-                    if detect_market(c2) and candidate_player_name_from_text_and_related(obj2, idx):
-                        sample_text = c2[:350]
+                    if detect_market(c2):
+                        sample_text = c2[:500]
                         break
                 if sample_text:
-                    log_source_request(url, "DEBUG_NO_LINE_SAMPLE", sample_text)
+                    log_source_request(url, "DEBUG_MARKET_SAMPLE", sample_text)
             except Exception:
                 pass
 
