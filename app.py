@@ -19,7 +19,7 @@ import pandas as pd
 import requests
 import streamlit as st
 
-APP_VERSION = "WNBA v2.8 TITLE NAME PARSER"
+APP_VERSION = "WNBA v2.9 NBA LEAK BLOCKER"
 
 # =========================
 # STORAGE
@@ -662,6 +662,64 @@ def is_bad_player_like_name(name):
         return True
     return False
 
+
+NBA_NAME_BLOCKLIST = {
+    # Common NBA players that should never appear in WNBA board.
+    "victor wembanyama", "nikola jokic", "luka doncic", "shai gilgeous alexander",
+    "lebron james", "stephen curry", "kevin durant", "anthony edwards",
+    "jayson tatum", "jaylen brown", "giannis antetokounmpo", "joel embiid",
+    "jalen brunson", "donovan mitchell", "devin booker", "kyrie irving",
+    "anthony davis", "tyrese haliburton", "ja morant", "trae young",
+    "damian lillard", "paolo banchero", "cade cunningham", "zion williamson",
+    "james harden", "kawhi leonard", "paul george", "lamelo ball",
+    "bam adebayo", "domantas sabonis", "deaaron fox", "chet holmgren",
+    "scottie barnes", "tyrese maxey", "mikal bridges", "jimmy butler",
+    "jamal murray", "rudy gobert", "karl anthony towns", "jaren jackson jr",
+}
+
+WNBA_NAME_ALLOW_HINTS = {
+    # Core WNBA names to protect the fallback parser from NBA slips.
+    "aja wilson", "a ja wilson", "breanna stewart", "sabrina ionescu",
+    "caitlin clark", "angel reese", "napheesa collier", "alyssa thomas",
+    "kelsey plum", "jackie young", "chelsea gray", "arike ogunbowale",
+    "nneka ogwumike", "jewell loyd", "skylar diggins", "kahleah copper",
+    "diana taurasi", "brittney griner", "aliyah boston", "kelsey mitchell",
+    "rhyne howard", "allisha gray", "dearica hamby", "rickea jackson",
+    "azura stevens", "brionna jones", "dewanna bonner", "marina mabrey",
+    "di jonai carrington", "dijonai carrington", "natasha cloud",
+    "natasha howard", "sophie cunningham", "satou sabally", "maddy siegrist",
+    "kayla mcbride", "courtney williams", "alanna smith", "diamond miller",
+    "shakira austin", "brittney sykes", "aaliyah edwards", "elena delle donne",
+    "gabby williams", "nneka ogwumike", "jonquel jones", "betnijah laney",
+    "leonie fiebich", "nyara sabally", "teaira mccowan", "saniya rivers",
+    "paige bueckers", "sonia citron", "kiki iriafen", "hailey van lith",
+    "li yueru", "kate martin", "monique billings", "erica wheeler",
+    "lexie hull", "victoria vivians", "na lyssa smith", "nalyssa smith",
+    "temi fagbenle", "jordin canada", "cheyenne parker", "aari mcdonald",
+    "zhalia mccall", "maya caldwell", "lexie brown", "rae burrell",
+    "natalie achonwa", "elizabeth williams", "moriah jefferson",
+}
+
+def is_known_nba_name(name):
+    n = normalize_name(name)
+    if n in NBA_NAME_BLOCKLIST:
+        return True
+    # Obvious NBA-only surname protections for unique names.
+    nba_unique_tokens = ["wembanyama", "jokic", "doncic", "gilgeous", "antetokounmpo"]
+    return any(tok in n for tok in nba_unique_tokens)
+
+def is_likely_wnba_name(name, combined_text=""):
+    n = normalize_name(name)
+    raw = " " + str(combined_text or "").lower() + " "
+    if is_known_nba_name(name):
+        return False
+    if n in WNBA_NAME_ALLOW_HINTS:
+        return True
+    if " wnba" in raw or "women" in raw or "women's" in raw or "basketball_wnba" in raw:
+        return True
+    # If no explicit WNBA marker, do not accept random names from a mixed Underdog payload.
+    return False
+
 def underdog_text_is_wnba(text, payload_has_wnba=False):
     raw = " " + str(text or "").lower() + " "
 
@@ -670,13 +728,14 @@ def underdog_text_is_wnba(text, payload_has_wnba=False):
         return False
     if object_mentions_other_basketball_league(raw):
         return False
+    if any(x in raw for x in [" wembanyama", " lebron ", " doncic", " jokic", " gilgeous", " curry"]):
+        return False
 
     # Strong accept when the related object chain itself says WNBA/women.
     if " wnba" in raw or " women" in raw or " women's" in raw or "basketball_wnba" in raw:
         return True
 
-    # Payload-only fallback is dangerous. Allow it only when the row looks like a basketball prop
-    # and does not look like an event title/sport row.
+    # Payload-only fallback is allowed only later if the recovered name is WNBA allowlisted.
     if payload_has_wnba:
         basketball_markers = [" points", " rebounds", " assists", " pts", " rebs", " asts", " 3pt", "3pm"]
         return any(x in raw for x in basketball_markers)
@@ -870,6 +929,7 @@ def fetch_underdog_wnba_props():
         debug_market = 0
         debug_name = 0
         debug_line = 0
+        debug_rejected_name = 0
 
         for obj in objects:
             if not isinstance(obj, dict):
@@ -908,8 +968,12 @@ def fetch_underdog_wnba_props():
                     price = p
                     break
 
-            # Final WNBA-only safety: reject non-player/event/team titles.
+            # Final WNBA-only safety: reject non-player/event/team/NBA titles.
             if is_bad_player_like_name(name):
+                debug_rejected_name += 1
+                continue
+            if not is_likely_wnba_name(name, combined):
+                debug_rejected_name += 1
                 continue
 
             rows.append({
@@ -947,14 +1011,14 @@ def fetch_underdog_wnba_props():
             log_source_request(
                 url,
                 "OK",
-                f"{len(rows)} WNBA props parsed relationship-aware | candidates={debug_candidates}, market={debug_market}, name={debug_name}, line={debug_line}, objects={len(objects)}"
+                f"{len(rows)} WNBA props parsed relationship-aware | candidates={debug_candidates}, market={debug_market}, name={debug_name}, line={debug_line}, rejected_name={debug_rejected_name}, objects={len(objects)}"
             )
             break
         else:
             log_source_request(
                 url,
                 "OK_NO_WNBA_ROWS",
-                f"payload_has_wnba={payload_has_wnba}, candidates={debug_candidates}, market={debug_market}, name={debug_name}, line={debug_line}, objects={len(objects)}"
+                f"payload_has_wnba={payload_has_wnba}, candidates={debug_candidates}, market={debug_market}, name={debug_name}, line={debug_line}, rejected_name={debug_rejected_name}, objects={len(objects)}"
             )
 
     return clean_prop_rows(all_rows)
