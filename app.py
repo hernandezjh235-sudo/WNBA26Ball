@@ -19,7 +19,7 @@ import pandas as pd
 import requests
 import streamlit as st
 
-APP_VERSION = "WNBA v3.4 HEADERS FIX"
+APP_VERSION = "WNBA v3.5 STATS HELPER FIX"
 
 # =========================
 # STORAGE
@@ -798,6 +798,28 @@ def is_likely_wnba_name_dynamic(name, combined_text="", dynamic_names=None):
 
 
 
+
+def stats_df_from_result(data, idx=0):
+    """Safely convert stats.nba.com resultSets into a DataFrame.
+
+    If stats.nba.com times out, blocks, or changes shape, return an empty table
+    instead of crashing the Streamlit app.
+    """
+    try:
+        if not data or not isinstance(data, dict):
+            return pd.DataFrame()
+        result_sets = data.get("resultSets") or data.get("resultsets") or []
+        if not result_sets or idx >= len(result_sets):
+            return pd.DataFrame()
+        result = result_sets[idx]
+        headers = result.get("headers") or []
+        rows = result.get("rowSet") or result.get("rowset") or []
+        if not headers or rows is None:
+            return pd.DataFrame()
+        return pd.DataFrame(rows, columns=headers)
+    except Exception:
+        return pd.DataFrame()
+
 @st.cache_data(ttl=1800, show_spinner=False)
 def get_wnba_player_dashboard(season="2025", last_n="0"):
     url = f"{NBA_STATS_BASE}/leaguedashplayerstats"
@@ -1519,9 +1541,21 @@ if should_load:
     with st.spinner("Loading real WNBA prop board..."):
         prop_rows = fetch_all_real_wnba_props(source_choice)
         if load_stats:
-            season_df = get_wnba_player_dashboard(season=season, last_n="0")
-            last5_df = get_wnba_player_dashboard(season=season, last_n="5")
-            last10_df = get_wnba_player_dashboard(season=season, last_n="10")
+            try:
+                season_df = get_wnba_player_dashboard(season=season, last_n="0")
+            except Exception as e:
+                log_source_request("wnba_player_dashboard_season", "ERROR", str(e))
+                season_df = pd.DataFrame()
+            try:
+                last5_df = get_wnba_player_dashboard(season=season, last_n="5")
+            except Exception as e:
+                log_source_request("wnba_player_dashboard_l5", "ERROR", str(e))
+                last5_df = pd.DataFrame()
+            try:
+                last10_df = get_wnba_player_dashboard(season=season, last_n="10")
+            except Exception as e:
+                log_source_request("wnba_player_dashboard_l10", "ERROR", str(e))
+                last10_df = pd.DataFrame()
         else:
             season_df = pd.DataFrame()
             last5_df = pd.DataFrame()
