@@ -19,7 +19,7 @@ import pandas as pd
 import requests
 import streamlit as st
 
-APP_VERSION = "WNBA v3.3 NAMEERROR FIX"
+APP_VERSION = "WNBA v3.4 HEADERS FIX"
 
 # =========================
 # STORAGE
@@ -815,6 +815,23 @@ def get_wnba_player_dashboard(season="2025", last_n="0"):
     data = safe_get_json(url, params=params, headers=nba_stats_headers(), timeout=8)
     return stats_df_from_result(data)
 
+
+def nba_stats_headers():
+    """Headers for stats.nba.com / WNBA stats calls.
+
+    Kept as a helper so scoreboard/stat calls do not crash if the endpoint times out.
+    """
+    return {
+        "Host": "stats.nba.com",
+        "Connection": "keep-alive",
+        "Accept": "application/json, text/plain, */*",
+        "x-nba-stats-token": "true",
+        "User-Agent": "Mozilla/5.0",
+        "x-nba-stats-origin": "stats",
+        "Origin": "https://www.wnba.com",
+        "Referer": "https://www.wnba.com/",
+    }
+
 @st.cache_data(ttl=900, show_spinner=False)
 def get_wnba_scoreboard(date_str):
     url = f"{NBA_STATS_BASE}/scoreboardv2"
@@ -1509,8 +1526,16 @@ if should_load:
             season_df = pd.DataFrame()
             last5_df = pd.DataFrame()
             last10_df = pd.DataFrame()
-        games_today = get_wnba_scoreboard(today_str())
-        games_tomorrow = get_wnba_scoreboard(tomorrow_str())
+        try:
+            games_today = get_wnba_scoreboard(today_str())
+        except Exception as e:
+            log_source_request("wnba_scoreboard_today", "ERROR", str(e))
+            games_today = []
+        try:
+            games_tomorrow = get_wnba_scoreboard(tomorrow_str())
+        except Exception as e:
+            log_source_request("wnba_scoreboard_tomorrow", "ERROR", str(e))
+            games_tomorrow = []
         board_df = build_board(prop_rows, season_df, last5_df, last10_df)
         st.session_state["board_df"] = board_df
         st.session_state["games_today"] = games_today
