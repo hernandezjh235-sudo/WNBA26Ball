@@ -1,152 +1,216 @@
 # -*- coding: utf-8 -*-
-# ============================================================
-# WNBA PROP ENGINE — STREAMLIT SAFE FIX
-# Loads fast first, then pulls real lines. No fake lines.
-# Underdog-first, PrizePicks backup, full player cards, grading/learning/CLV.
-# ============================================================
+"""
+WNBA ELITE PROP + MONEYLINE ENGINE — ONE FILE — v1.0
+Built from the same architecture philosophy as MLB v11.17, but fully WNBA-only.
+
+Markets:
+- Player Points
+- Player Rebounds
+- Player Assists
+- Moneyline
+
+Core principles:
+- Real stats only from public ESPN WNBA endpoints.
+- Real prop lines only from Underdog / PrizePicks when available.
+- Optional manual line override for testing only; clearly labeled MANUAL.
+- No fake generated prop lines.
+- Streamlit/Railway ready.
+
+Run locally:
+    streamlit run wnba_elite_prop_moneyline_engine.py
+
+Railway start command:
+    streamlit run wnba_elite_prop_moneyline_engine.py --server.address=0.0.0.0 --server.port=$PORT
+"""
 
 import os
 import re
+import io
 import json
 import math
+import time
+import html
 import difflib
 import unicodedata
-from datetime import datetime, timedelta
-from pathlib import Path
+from datetime import datetime, timedelta, date
+from typing import Any, Dict, List, Optional, Tuple
 
 import numpy as np
 import pandas as pd
 import requests
 import streamlit as st
 
-APP_VERSION = "WNBA v3.5 STATS HELPER FIX"
+try:
+    import pytz
+except Exception:
+    pytz = None
 
-# =========================
+APP_VERSION = "WNBA_ELITE_PROP_MONEYLINE_ENGINE_v1.1_UD2_INJURY_DVP_MINUTES_GATE"
+
+# ============================================================
 # STORAGE
-# =========================
-STORAGE_DIR = os.getenv("STORAGE_DIR", "wnba_engine")
-Path(STORAGE_DIR).mkdir(parents=True, exist_ok=True)
+# ============================================================
+DRIVE_DIR = "/content/drive/MyDrive/wnba_engine"
+LOCAL_DIR = "wnba_engine"
+try:
+    from google.colab import drive  # type: ignore
+    if not os.path.exists("/content/drive/MyDrive"):
+        drive.mount("/content/drive", force_remount=False)
+    os.makedirs(DRIVE_DIR, exist_ok=True)
+    STORAGE_DIR = DRIVE_DIR
+except Exception:
+    os.makedirs(LOCAL_DIR, exist_ok=True)
+    STORAGE_DIR = LOCAL_DIR
 
-PICK_LOG = os.path.join(STORAGE_DIR, "official_pick_log.json")
-RESULT_LOG = os.path.join(STORAGE_DIR, "graded_result_log.json")
-LEARN_FILE = os.path.join(STORAGE_DIR, "player_learning.json")
-CLV_FILE = os.path.join(STORAGE_DIR, "clv_tracker.json")
-LINE_HISTORY_FILE = os.path.join(STORAGE_DIR, "line_history.json")
-REQUEST_LOG_FILE = os.path.join(STORAGE_DIR, "request_log.json")
-BEFORE_AFTER_FILE = os.path.join(STORAGE_DIR, "before_after_snapshots.json")
+PICK_LOG = os.path.join(STORAGE_DIR, "wnba_pick_log.json")
+RESULT_LOG = os.path.join(STORAGE_DIR, "wnba_result_log.json")
+LEARN_FILE = os.path.join(STORAGE_DIR, "wnba_learning.json")
+CLV_FILE = os.path.join(STORAGE_DIR, "wnba_clv_tracker.json")
+LINE_HISTORY_FILE = os.path.join(STORAGE_DIR, "wnba_line_history.json")
+REQUEST_LOG_FILE = os.path.join(STORAGE_DIR, "wnba_request_log.json")
+CALIBRATION_FILE = os.path.join(STORAGE_DIR, "wnba_calibration.json")
+UNDERDOG_DEBUG_FILE = os.path.join(STORAGE_DIR, "wnba_underdog_debug.json")
+INJURY_CONTROL_FILE = os.path.join(STORAGE_DIR, "wnba_injury_controls.json")
 
+# ============================================================
+# DATA SOURCES
+# ============================================================
+ESPN_SITE = "https://site.api.espn.com/apis/site/v2/sports/basketball/wnba"
+ESPN_COMMON = "https://site.web.api.espn.com/apis/common/v3/sports/basketball/wnba"
+ESPN_CORE = "https://sports.core.api.espn.com/v2/sports/basketball/leagues/wnba"
+PRIZEPICKS_URL = "https://api.prizepicks.com/projections"
 UNDERDOG_URLS = [
     "https://api.underdogfantasy.com/beta/v6/over_under_lines",
     "https://api.underdogfantasy.com/beta/v5/over_under_lines",
     "https://api.underdogfantasy.com/beta/v4/over_under_lines",
     "https://api.underdogfantasy.com/beta/v3/over_under_lines",
-    "https://api.underdogfantasy.com/beta/v2/over_under_lines",
     "https://api.underdogfantasy.com/v1/over_under_lines",
 ]
-PRIZEPICKS_URL = "https://api.prizepicks.com/projections"
+ODDS_API_BASE = "https://api.the-odds-api.com/v4"
 
-NBA_STATS_BASE = "https://stats.nba.com/stats"
-WNBA_LEAGUE_ID = "10"
-
-MARKET_LABELS = {
-    "points": "Points",
-    "rebounds": "Rebounds",
-    "assists": "Assists",
-    "pts_rebs_asts": "Pts + Rebs + Asts",
-    "pts_rebs": "Pts + Rebs",
-    "pts_asts": "Pts + Asts",
-    "rebs_asts": "Rebs + Asts",
-    "threes": "3PT Made",
-    "steals": "Steals",
-    "blocks": "Blocks",
+# ============================================================
+# MODEL SETTINGS
+# ============================================================
+SIMS = 14000
+ML_SIMS = 12000
+MIN_BETTABLE_PROB = 0.635
+MIN_BETTABLE_EDGE = {
+    "Points": 1.25,
+    "Rebounds": 0.85,
+    "Assists": 0.65,
 }
-
-SUPPORTED_MARKETS = {
-    "points": ["points", "pts"],
-    "rebounds": ["rebounds", "rebs", "reb"],
-    "assists": ["assists", "asts", "ast"],
-    "pts_rebs_asts": ["pts+rebs+asts", "points+rebounds+assists", "pra", "pts + rebs + asts"],
-    "pts_rebs": ["pts+rebs", "points+rebounds", "points + rebounds"],
-    "pts_asts": ["pts+asts", "points+assists", "points + assists"],
-    "rebs_asts": ["rebs+asts", "rebounds+assists", "rebounds + assists"],
-    "threes": ["3-pointers made", "three pointers made", "3pt made", "3pm", "threes", "three pointers"],
-    "steals": ["steals", "stls", "stl"],
-    "blocks": ["blocks", "blks", "blk"],
-}
-
-MIN_PASS_SCORE = 78
-MIN_PASS_PROB = 0.57
-MIN_PASS_EDGE = 0.55
-MIN_ELITE_SCORE = 88
-MIN_ELITE_PROB = 0.62
-MIN_ELITE_EDGE = 0.90
+MIN_DATA_SCORE = 88
+MIN_OFFICIAL_SAVE_SCORE = 88
 MAX_RECOMMENDED_KELLY = 0.02
+DEFAULT_ODDS = -110
+CURRENT_SEASON = 2026
 
-LEARNING_MIN_SAMPLES = 4
-LEARNING_RATE = 0.04
-LEARNING_SCALE_MIN = 0.90
-LEARNING_SCALE_MAX = 1.10
+MARKETS = ["Points", "Rebounds", "Assists"]
+STAT_KEYS = {"Points": "PTS", "Rebounds": "REB", "Assists": "AST"}
+PROP_ALIASES = {
+    "points": "Points", "pts": "Points", "player points": "Points",
+    "rebounds": "Rebounds", "rebs": "Rebounds", "reb": "Rebounds", "player rebounds": "Rebounds",
+    "assists": "Assists", "asts": "Assists", "ast": "Assists", "player assists": "Assists",
+}
+TEAM_ABBR_FIX = {
+    "CON": "CONN", "CONN": "CONN", "LAS": "LV", "LVA": "LV", "LV": "LV",
+    "NYL": "NY", "NY": "NY", "PHO": "PHX", "PHX": "PHX", "WSH": "WAS", "WAS": "WAS",
+}
 
-# =========================
-# STREAMLIT CONFIG FIRST
-# =========================
+# ============================================================
+# STREAMLIT CONFIG + UI
+# ============================================================
 st.set_page_config(
-    page_title="WNBA Prop Engine",
+    page_title="WNBA Elite Prop + Moneyline Engine",
     layout="wide",
     initial_sidebar_state="expanded",
 )
 
 st.markdown("""
 <style>
-.stApp {background:radial-gradient(circle at top left,#141827 0%,#07090f 42%,#020204 100%);color:#fff;}
-.block-container {padding-top:1.0rem;max-width:1650px;}
-.hero-panel {background:linear-gradient(135deg,rgba(30,38,72,.96),rgba(8,10,18,.98));border:1px solid rgba(128,162,255,.38);border-radius:26px;padding:22px;box-shadow:0 0 32px rgba(80,120,255,.16);margin-bottom:18px;}
-.big-title {font-size:42px;font-weight:950;letter-spacing:-1px;}
-.sub-title {color:#c7cfdf;font-size:15px;margin-top:-6px;}
-.small-muted {color:#aeb6c8;font-size:13px;}
-.clean-card {background:linear-gradient(145deg,#10131d,#090b12);border:1px solid rgba(145,170,255,.22);border-radius:20px;padding:18px;box-shadow:0 0 18px rgba(80,120,255,.08);margin-bottom:14px;}
-.green-card {background:linear-gradient(145deg,#061c13,#07100c);border:1px solid rgba(0,255,145,.34);border-radius:20px;padding:18px;box-shadow:0 0 20px rgba(0,255,145,.13);margin-bottom:14px;}
-.warn-card {background:linear-gradient(145deg,#211600,#100b02);border:1px solid rgba(255,195,70,.34);border-radius:20px;padding:18px;box-shadow:0 0 18px rgba(255,195,70,.10);margin-bottom:14px;}
-.red-card {background:linear-gradient(145deg,#240808,#100404);border:1px solid rgba(255,90,90,.34);border-radius:20px;padding:18px;box-shadow:0 0 18px rgba(255,90,90,.10);margin-bottom:14px;}
-.game-card {background:linear-gradient(145deg,#12182a,#080a12);border:1px solid rgba(145,170,255,.28);border-radius:18px;padding:14px;margin-bottom:10px;}
-.badge {display:inline-block;padding:6px 11px;border-radius:999px;background:#141827;border:1px solid rgba(160,180,255,.38);color:#dce5ff;font-weight:850;margin:3px 4px 3px 0;}
-.good-badge {background:#002818;border-color:rgba(0,255,145,.48);color:#b9ffdc;}
-.yellow-badge {background:#2a1e00;border-color:rgba(255,210,70,.48);color:#ffe6a6;}
-.red-badge {background:#2a0707;border-color:rgba(255,90,90,.48);color:#ffc4c4;}
-.blue-badge {background:#111d38;border-color:rgba(128,162,255,.48);color:#dce5ff;}
-.kpi-strip {display:grid;grid-template-columns:repeat(6,minmax(0,1fr));gap:12px;margin:12px 0 18px 0;}
-.kpi-box {background:linear-gradient(145deg,#10131d,#080a10);border:1px solid rgba(145,170,255,.24);border-radius:18px;padding:14px;min-height:92px;}
-.kpi-label {font-size:12px;color:#aeb6c8;font-weight:850;letter-spacing:.04em;text-transform:uppercase;}
-.kpi-value {font-size:25px;font-weight:950;color:#fff;margin-top:6px;}
-.kpi-sub {font-size:12px;color:#c7cfdf;margin-top:5px;}
+.stApp {background: radial-gradient(circle at top,#101b30 0%,#080b12 42%,#020307 100%); color:#fff;}
+.block-container {padding-top:1.0rem; max-width:1550px;}
+h1,h2,h3 {color:#fff;}
+[data-testid="stMetric"] {
+    background:linear-gradient(145deg,#0d1420,#09111c);
+    border:1px solid rgba(61,150,255,.34);
+    border-radius:18px;
+    padding:15px;
+    box-shadow:0 0 18px rgba(0,120,255,.12);
+}
+.hero-panel {
+    background:linear-gradient(135deg,rgba(11,38,70,.94),rgba(6,8,13,.97));
+    border:1px solid rgba(92,178,255,.38);
+    border-radius:26px;
+    padding:22px;
+    box-shadow:0 0 34px rgba(0,120,255,.14);
+    margin-bottom:18px;
+}
+.pick-card {
+    background:linear-gradient(145deg,#0b1019,#0d1622);
+    border:1px solid rgba(92,178,255,.30);
+    border-radius:22px;
+    padding:20px;
+    box-shadow:0 0 24px rgba(0,120,255,.11);
+    margin-bottom:16px;
+}
+.green-card {background:linear-gradient(145deg,#001b0e,#07110b);border:1px solid rgba(0,255,135,.46);border-radius:22px;padding:20px;box-shadow:0 0 28px rgba(0,255,135,.18);margin-bottom:16px;}
+.warn-card {background:linear-gradient(145deg,#1e1604,#11100b);border:1px solid rgba(255,190,60,.42);border-radius:22px;padding:20px;box-shadow:0 0 22px rgba(255,190,60,.10);margin-bottom:16px;}
+.small-muted {color:#b7c1cd; font-size:13px;}
+.big-title {font-size:40px; font-weight:950; color:#fff; letter-spacing:-1px;}
+.sub-title {color:#c8d2dd; font-size:15px; margin-top:-6px;}
+.player-name {font-size:23px; font-weight:900; color:#fff;}
+.big-number {font-size:42px; font-weight:950; line-height:1.05;}
+.green {color:#31e84f;} .orange {color:#ffbe3c;} .red {color:#ff5f5f;} .blue {color:#66b7ff;}
+.badge {display:inline-block;padding:6px 12px;border-radius:999px;background:#081c33;border:1px solid rgba(100,180,255,.45);color:#cce9ff;font-weight:800;margin:3px 4px 3px 0;}
+.good-badge {background:#002916;border-color:rgba(0,255,135,.55);color:#b5ffd9;}
+.yellow-badge {background:#2b1d00;border-color:rgba(255,210,70,.55);color:#ffe2a1;}
+.red-badge {background:#2b0000;border-color:rgba(255,75,75,.55);color:#ffc0c0;}
+.kpi-strip {display:grid; grid-template-columns: repeat(6, minmax(0, 1fr)); gap:12px; margin:12px 0 18px 0;}
+.kpi-box {background:linear-gradient(145deg,#0b1019,#0d1622);border:1px solid rgba(92,178,255,.25);border-radius:18px;padding:14px;min-height:92px;}
+.kpi-label {font-size:12px;color:#aeb7c2;font-weight:800;letter-spacing:.04em;text-transform:uppercase;}
+.kpi-value {font-size:26px;font-weight:900;color:#fff;margin-top:6px;}
+.kpi-sub {font-size:12px;color:#cbd2db;margin-top:5px;}
+.hr-soft {border-top:1px solid rgba(255,255,255,.12); margin:14px 0;}
+.section-title-pro {margin-top:22px;margin-bottom:10px;font-size:24px;font-weight:950;color:#fff;border-left:5px solid #66b7ff;padding-left:12px;}
 .stTabs [data-baseweb="tab"] {color:#b8c3cf;font-weight:850;}
-.stTabs [aria-selected="true"] {color:#8db3ff!important;border-bottom:3px solid #8db3ff;}
-[data-testid="stMetric"] {background:linear-gradient(145deg,#10131d,#080a10);border:1px solid rgba(145,170,255,.24);border-radius:18px;padding:13px;}
-@media (max-width:1100px){.kpi-strip{grid-template-columns:repeat(2,minmax(0,1fr));}}
+.stTabs [aria-selected="true"] {color:#31e84f!important;border-bottom:3px solid #31e84f;}
+@media (max-width: 900px) {.kpi-strip {grid-template-columns: repeat(2, minmax(0, 1fr));}.big-title{font-size:30px}.block-container{padding-left:.65rem!important;padding-right:.65rem!important}}
 </style>
 """, unsafe_allow_html=True)
 
-# =========================
+# ============================================================
 # HELPERS
-# =========================
-def now_iso():
+# ============================================================
+def get_secret(key: str, default: str = "") -> str:
+    try:
+        return st.secrets[key]
+    except Exception:
+        return os.getenv(key, default)
+
+ODDS_API_KEY = get_secret("ODDS_API_KEY", "")
+
+
+def now_iso() -> str:
     return datetime.now().isoformat(timespec="seconds")
 
-def today_str():
-    return datetime.now().strftime("%Y-%m-%d")
 
-def tomorrow_str():
-    return (datetime.now() + timedelta(days=1)).strftime("%Y-%m-%d")
+def california_now() -> datetime:
+    if pytz:
+        return datetime.now(pytz.timezone("America/Los_Angeles"))
+    return datetime.utcnow() - timedelta(hours=7)
 
-def safe_float(x, default=None):
+
+def safe_float(x: Any, default: Optional[float] = None) -> Optional[float]:
     try:
-        if x is None or x == "":
+        if x is None or x == "" or str(x).lower() in ["nan", "none", "null"]:
             return default
         return float(x)
     except Exception:
         return default
 
-def safe_int(x, default=None):
+
+def safe_int(x: Any, default: Optional[int] = None) -> Optional[int]:
     try:
         if x is None or x == "":
             return default
@@ -154,45 +218,51 @@ def safe_int(x, default=None):
     except Exception:
         return default
 
-def clamp(x, lo, hi):
+
+def clamp(x: float, lo: float, hi: float) -> float:
     return max(lo, min(hi, x))
 
-def load_json(path, default):
+
+def load_json(path: str, default: Any) -> Any:
     try:
         if os.path.exists(path):
-            with open(path, "r") as f:
+            with open(path, "r", encoding="utf-8") as f:
                 return json.load(f)
     except Exception:
         pass
     return default
 
-def save_json(path, data):
+
+def save_json(path: str, data: Any) -> None:
     try:
-        Path(os.path.dirname(path)).mkdir(parents=True, exist_ok=True)
-        with open(path, "w") as f:
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(path, "w", encoding="utf-8") as f:
             json.dump(data, f, indent=2)
     except Exception:
         pass
 
-def log_source_request(source, status, message=""):
-    rows = load_json(REQUEST_LOG_FILE, [])
-    rows.append({"time": now_iso(), "source": str(source)[:220], "status": str(status)[:80], "message": str(message)[:500]})
-    save_json(REQUEST_LOG_FILE, rows[-500:])
 
-def strip_accents(text):
+def log_source_request(source: str, status: str, message: str = "") -> None:
+    rows = load_json(REQUEST_LOG_FILE, [])
+    rows.append({"time": now_iso(), "source": str(source)[:220], "status": str(status)[:100], "message": str(message)[:500]})
+    save_json(REQUEST_LOG_FILE, rows[-800:])
+
+
+def strip_accents(text: Any) -> str:
     try:
         return "".join(ch for ch in unicodedata.normalize("NFKD", str(text or "")) if not unicodedata.combining(ch))
     except Exception:
         return str(text or "")
 
-def normalize_name(name):
+
+def normalize_name(name: Any) -> str:
     s = strip_accents(name).lower().strip()
-    s = re.sub(r"[^a-z0-9 ]+", " ", s)
-    for suffix in [" jr", " sr", " ii", " iii", " iv"]:
-        s = s.replace(suffix, " ")
+    for ch in [".", ",", "'", "-", "_", " jr", " sr", " ii", " iii", " iv"]:
+        s = s.replace(ch, " ")
     return " ".join(s.split())
 
-def name_score(a, b):
+
+def name_score(a: Any, b: Any) -> float:
     a_norm, b_norm = normalize_name(a), normalize_name(b)
     if not a_norm or not b_norm:
         return 0.0
@@ -200,27 +270,49 @@ def name_score(a, b):
         return 1.0
     if a_norm in b_norm or b_norm in a_norm:
         return 0.94
-    ap, bp = a_norm.split(), b_norm.split()
-    if ap and bp and ap[-1] == bp[-1] and ap[0][:1] == bp[0][:1]:
+    a_parts, b_parts = a_norm.split(), b_norm.split()
+    if a_parts and b_parts and a_parts[-1] == b_parts[-1] and a_parts[0][:1] == b_parts[0][:1]:
         return 0.93
     return difflib.SequenceMatcher(None, a_norm, b_norm).ratio()
 
-def safe_get_json(url, params=None, timeout=8, headers=None):
+
+def clean_team_abbr(x: Any) -> str:
+    s = str(x or "").upper().strip()
+    return TEAM_ABBR_FIX.get(s, s)
+
+
+def fmt(x: Any, digits: int = 2, default: str = "—") -> str:
+    v = safe_float(x)
+    if v is None:
+        return default
+    return f"{v:.{digits}f}"
+
+
+@st.cache_data(ttl=300, show_spinner=False)
+def safe_get_json(url: str, params: Optional[Dict[str, Any]] = None, timeout: int = 15, headers: Optional[Dict[str, str]] = None) -> Any:
     try:
-        h = {"User-Agent": "Mozilla/5.0 WNBAPropEngine/2.1", "Accept": "application/json,text/plain,*/*"}
+        h = {
+            "User-Agent": "Mozilla/5.0 WNBAElitePropEngine/1.0",
+            "Accept": "application/json,text/plain,*/*",
+        }
         if headers:
             h.update(headers)
         r = requests.get(url, params=params, timeout=timeout, headers=h)
         if r.status_code != 200:
             log_source_request(url, f"HTTP {r.status_code}", r.text[:300])
             return None
-        return r.json()
+        try:
+            return r.json()
+        except Exception as e:
+            log_source_request(url, "BAD_JSON", str(e))
+            return None
     except Exception as e:
         log_source_request(url, "REQUEST_ERROR", str(e))
         return None
 
-def flatten_json(obj):
-    items = []
+
+def flatten_json(obj: Any) -> List[dict]:
+    items: List[dict] = []
     if isinstance(obj, dict):
         items.append(obj)
         for v in obj.values():
@@ -230,1470 +322,1561 @@ def flatten_json(obj):
             items.extend(flatten_json(x))
     return items
 
-def parse_prop_date_from_text_or_obj(obj):
-    """Best-effort date extraction from prop-feed rows.
-
-    Many public Underdog rows do not expose a clean game date field. If we cannot
-    read a date, we keep the line visible on All Lines instead of hiding it.
-    """
-    if not isinstance(obj, dict):
+# ============================================================
+# BETTING MATH
+# ============================================================
+def american_to_implied(price: Any) -> Optional[float]:
+    price = safe_float(price)
+    if price is None:
         return None
-    keys = [
-        "scheduled_at", "starts_at", "start_time", "game_date", "date",
-        "match_date", "commence_time", "event_time", "game_time"
-    ]
-    for k in keys:
-        v = obj.get(k)
-        if isinstance(v, str) and len(v) >= 8:
-            try:
-                # Handles 2026-05-17, 2026-05-17T00:00:00Z, etc.
-                return v[:10]
-            except Exception:
-                pass
-    try:
-        blob = json.dumps(obj, default=str)
-        m = re.search(r"(20\d{2}-\d{2}-\d{2})", blob)
-        if m:
-            return m.group(1)
-    except Exception:
-        pass
-    return None
-
-def day_label_from_date(prop_date):
-    if prop_date == today_str():
-        return "Today"
-    if prop_date == tomorrow_str():
-        return "Tomorrow"
-    if prop_date:
-        return prop_date
-    return "Unknown"
-
-def has_bad_cross_sport_terms(text):
-    raw = " " + str(text or "").lower() + " "
-    bad_terms = [
-        " mlb", " baseball", " pitcher", " strikeout", " strikeouts",
-        " nfl", " football", " nhl", " hockey", " soccer", " tennis",
-        " golf", " mma", " ufc", " ncaab", " ncaa", " college",
-        " esports", " esport", " nascar", " dota", " dota 2", " counter-strike", " counter strike",
-        " cs2", " csgo", " valorant", " league of legends", " lol esports", " gaming",
-        " natus vincere", " xtreme gaming", " fnatic", " faze", " team liquid"
-    ]
-    return any(x in raw for x in bad_terms)
-
-def object_mentions_other_basketball_league(text):
-    raw = " " + str(text or "").lower() + " "
-    # NBA rows sometimes say NBA explicitly. Block those unless the same object also says WNBA.
-    if " wnba" in raw or " women" in raw or " women's" in raw:
-        return False
-    return " nba" in raw or " basketball_nba" in raw or " mens basketball" in raw or " men basketball" in raw
+    return 100 / (price + 100) if price > 0 else abs(price) / (abs(price) + 100)
 
 
-def ud_attrs(obj):
-    """Return Underdog attrs merged with top-level fields."""
-    if not isinstance(obj, dict):
-        return {}
-    out = {}
-    attrs = obj.get("attributes")
-    if isinstance(attrs, dict):
-        out.update(attrs)
-    for k, v in obj.items():
-        if k not in ["attributes", "relationships", "included", "data"]:
-            out.setdefault(k, v)
-    return out
-
-def underdog_object_key(obj):
-    if not isinstance(obj, dict):
+def decimal_odds(odds: Any) -> Optional[float]:
+    odds = safe_float(odds)
+    if odds is None:
         return None
-    oid = obj.get("id")
-    typ = obj.get("type")
-    if oid is None:
+    return 1 + odds / 100 if odds > 0 else 1 + 100 / abs(odds)
+
+
+def expected_value(prob: Optional[float], odds: Any) -> Optional[float]:
+    dec = decimal_odds(odds)
+    if prob is None or dec is None:
         return None
-    return (str(typ or ""), str(oid))
+    return (prob * (dec - 1)) - (1 - prob)
+
+
+def kelly_fraction(prob: Optional[float], odds: Any) -> float:
+    dec = decimal_odds(odds)
+    if prob is None or dec is None:
+        return 0.0
+    b = dec - 1
+    q = 1 - prob
+    if b <= 0:
+        return 0.0
+    return float(clamp(((b * prob) - q) / b, 0, 0.25))
+
+
+def no_vig_pair_prob(price_a: Optional[float], price_b: Optional[float]) -> Optional[float]:
+    ia = american_to_implied(price_a)
+    ib = american_to_implied(price_b)
+    if ia is None or ib is None or ia + ib <= 0:
+        return ia
+    return ia / (ia + ib)
+
+# ============================================================
+# ESPN WNBA DATA
+# ============================================================
+def target_dates(day_mode: str) -> List[str]:
+    now = california_now()
+    today = now.strftime("%Y-%m-%d")
+    tomorrow = (now + timedelta(days=1)).strftime("%Y-%m-%d")
+    if day_mode == "Today":
+        return [today]
+    if day_mode == "Tomorrow":
+        return [tomorrow]
+    return [today, tomorrow]
+
+
+def espn_date(date_str: str) -> str:
+    return date_str.replace("-", "")
+
+
+@st.cache_data(ttl=300, show_spinner=False)
+def get_scoreboard(date_str: str) -> Dict[str, Any]:
+    return safe_get_json(f"{ESPN_SITE}/scoreboard", params={"dates": espn_date(date_str), "limit": 50}) or {"events": []}
 
-def build_underdog_id_index(data):
-    """Index every typed/id object so line rows can resolve player/market/league relationships."""
-    idx = {}
-    for obj in flatten_json(data):
-        if not isinstance(obj, dict):
-            continue
-        key = underdog_object_key(obj)
-        if key:
-            idx[key] = obj
-            # also keep id-only fallback because some relationships omit type
-            idx[("", key[1])] = obj
-    return idx
-
-def relationship_refs(obj):
-    refs = []
-    if not isinstance(obj, dict):
-        return refs
-    rels = obj.get("relationships")
-    if not isinstance(rels, dict):
-        return refs
-
-    def add_ref(x):
-        if isinstance(x, dict):
-            if "data" in x:
-                add_ref(x.get("data"))
-                return
-            rid = x.get("id")
-            typ = x.get("type")
-            if rid is not None:
-                refs.append((str(typ or ""), str(rid)))
-        elif isinstance(x, list):
-            for item in x:
-                add_ref(item)
-
-    for v in rels.values():
-        add_ref(v)
-    return refs
-
-def combine_obj_and_related_text(obj, idx, depth=2):
-    """Collect text from an Underdog object and its related objects."""
-    seen = set()
-    parts = []
-
-    def walk(o, d):
-        if not isinstance(o, dict) or d < 0:
-            return
-        key = underdog_object_key(o)
-        if key and key in seen:
-            return
-        if key:
-            seen.add(key)
-
-        a = ud_attrs(o)
-        for k, v in a.items():
-            if isinstance(v, (str, int, float, bool)) and v not in [None, ""]:
-                parts.append(f"{k}:{v}")
-            elif isinstance(v, dict):
-                for kk, vv in v.items():
-                    if isinstance(vv, (str, int, float, bool)) and vv not in [None, ""]:
-                        parts.append(f"{k}.{kk}:{vv}")
-
-        # include a small JSON slice because some Underdog versions store names deep
-        try:
-            parts.append(json.dumps(o, default=str)[:1800])
-        except Exception:
-            pass
-
-        for ref in relationship_refs(o):
-            ro = idx.get(ref) or idx.get(("", ref[1]))
-            if ro is not None:
-                walk(ro, d - 1)
-
-    walk(obj, depth)
-    return " | ".join(parts)
-
-def candidate_player_name_from_text_and_related(obj, idx):
-    """Find a WNBA player name from direct player fields or market titles.
-
-    v2.8 fix:
-    Your logs showed market > 0 but name = 0. Underdog often stores names as
-    titles like 'Aja Wilson Points'. Earlier versions rejected those because
-    they contained market words. This version strips the market words and keeps
-    the player name.
-    """
-    candidates = []
-
-    def add_from(o):
-        if not isinstance(o, dict):
-            return
-        a = ud_attrs(o)
-
-        # First/last is strongest.
-        fn = a.get("first_name")
-        ln = a.get("last_name")
-        if isinstance(fn, str) and isinstance(ln, str):
-            candidates.append((fn + " " + ln).strip())
-
-        # Direct name fields.
-        for k in [
-            "player_name", "athlete_name", "full_name", "display_name",
-            "name", "abbr_name", "short_name"
-        ]:
-            v = a.get(k)
-            if isinstance(v, str) and len(v.strip()) >= 3:
-                candidates.append(v.strip())
-
-        # Title fields that may include market name.
-        for k in ["title", "display_title", "description", "over_under_title", "option_display"]:
-            v = a.get(k)
-            if isinstance(v, str):
-                cleaned = strip_market_words_from_title(v)
-                if cleaned:
-                    candidates.append(cleaned)
-
-    add_from(obj)
-    for ref in relationship_refs(obj):
-        ro = idx.get(ref) or idx.get(("", ref[1]))
-        add_from(ro)
-        if isinstance(ro, dict):
-            for ref2 in relationship_refs(ro):
-                ro2 = idx.get(ref2) or idx.get(("", ref2[1]))
-                add_from(ro2)
-
-    # Extra fallback: parse all related titles.
-    tc = title_candidates_from_obj_and_related(obj, idx)
-    if tc:
-        candidates.append(tc)
-
-    good = []
-    for c in candidates:
-        cc = str(c or "").strip()
-        if not cc:
-            continue
-
-        # If direct field still has market words, strip them before rejecting.
-        cleaned = strip_market_words_from_title(cc) or cc
-        if is_bad_player_like_name(cleaned):
-            continue
-
-        # Avoid obvious generic market/team labels.
-        low = cleaned.lower()
-        if low in ["points", "rebounds", "assists", "steals", "blocks", "wnba"]:
-            continue
-
-        good.append(cleaned)
-
-    if good:
-        return sorted(set(good), key=lambda x: (len(x), x))[0]
-    return None
-
-def extract_underdog_line_from_obj_or_related(obj, idx, market=None, combined_text=""):
-    """Find the numeric prop line from object, relationships, or readable text.
-
-    v2.6 fix:
-    Your logs showed market/name counts were positive but line=0. That means
-    Underdog exposed the player and market, but the numeric line was not in the
-    usual numeric JSON keys. This fallback scans related text too.
-    """
-    keys = [
-        "stat_value", "line_score", "over_under_line", "target_value", "line",
-        "value", "over_under", "total", "points", "line_value", "display_value",
-        "option_line", "projection", "projected_value", "stat_line", "line_display"
-    ]
-
-    def scan_numeric_keys(o):
-        if not isinstance(o, dict):
-            return None
-        a = ud_attrs(o)
-        for k in keys:
-            f = safe_float(a.get(k))
-            if sane_wnba_line(market, f) is not None:
-                return float(f)
-        return None
-
-    # 1) Numeric keys on object.
-    line = scan_numeric_keys(obj)
-    if line is not None:
-        return line
-
-    # 2) Numeric keys on related objects.
-    for ref in relationship_refs(obj):
-        ro = idx.get(ref) or idx.get(("", ref[1]))
-        line = scan_numeric_keys(ro)
-        if line is not None:
-            return line
-        if isinstance(ro, dict):
-            for ref2 in relationship_refs(ro):
-                ro2 = idx.get(ref2) or idx.get(("", ref2[1]))
-                line = scan_numeric_keys(ro2)
-                if line is not None:
-                    return line
-
-    # 3) Regex scan on combined object + related text.
-    text_blob = str(combined_text or "")
-    if not text_blob:
-        try:
-            text_blob = json.dumps(obj, default=str)
-        except Exception:
-            text_blob = ""
-
-    raw_candidates = []
-
-    # Prefer numbers near market words.
-    market_words = {
-        "points": r"(points|pts)",
-        "rebounds": r"(rebounds|rebs|reb)",
-        "assists": r"(assists|asts|ast)",
-        "pts_rebs_asts": r"(pra|points\s*\+\s*rebounds\s*\+\s*assists|pts\s*\+\s*rebs\s*\+\s*asts)",
-        "pts_rebs": r"(points\s*\+\s*rebounds|pts\s*\+\s*rebs)",
-        "pts_asts": r"(points\s*\+\s*assists|pts\s*\+\s*asts)",
-        "rebs_asts": r"(rebounds\s*\+\s*assists|rebs\s*\+\s*asts)",
-        "threes": r"(3\s*pt|3pt|3pm|three|threes|3-pointers)",
-        "steals": r"(steals|stls|stl)",
-        "blocks": r"(blocks|blks|blk)",
-    }
-
-    mw = market_words.get(market, r"(points|rebounds|assists)")
-    patterns = [
-        rf"(?i)(\d{{1,2}}(?:\.5|\.0)?)\s*(?:{mw})",
-        rf"(?i)(?:{mw})\D{{0,30}}(\d{{1,2}}(?:\.5|\.0)?)",
-        r"(?<!\d)(\d{1,2}\.5)(?!\d)",
-        r"(?<!\d)(\d{1,2}\.0)(?!\d)",
-    ]
-
-    for pat in patterns:
-        for m in re.findall(pat, text_blob):
-            if isinstance(m, tuple):
-                m = next((x for x in m if x and re.search(r"\d", x)), "")
-            f = safe_float(m)
-            if sane_wnba_line(market, f) is not None:
-                raw_candidates.append(float(f))
-
-    if not raw_candidates:
-        return None
-
-    vals = sorted(set(raw_candidates))
-
-    # Avoid selecting tiny unrelated numbers for points/combo markets if better high values exist.
-    if market == "points":
-        high = [v for v in vals if v >= 5.5]
-        vals = high or vals
-    elif market in ["pts_rebs_asts", "pts_rebs", "pts_asts"]:
-        high = [v for v in vals if v >= 8.5]
-        vals = high or vals
-
-    return float(vals[len(vals)//2])
-
-def sane_wnba_line(market, line):
-    line = safe_float(line)
-    if line is None:
-        return None
-    # Avoid metadata numbers like IDs, ranks, timestamps.
-    ranges = {
-        "points": (0.5, 45.5),
-        "rebounds": (0.5, 22.5),
-        "assists": (0.5, 16.5),
-        "pts_rebs_asts": (3.5, 75.5),
-        "pts_rebs": (2.5, 65.5),
-        "pts_asts": (2.5, 60.5),
-        "rebs_asts": (1.5, 35.5),
-        "threes": (0.5, 7.5),
-        "steals": (0.5, 5.5),
-        "blocks": (0.5, 5.5),
-    }
-    lo, hi = ranges.get(market, (0.5, 80.0))
-    if not (lo <= line <= hi):
-        return None
-    # Props can be whole on fantasy apps sometimes, but most are half. Allow both.
-    return float(line)
-
-
-def strip_market_words_from_title(title):
-    """Turn titles like 'A'ja Wilson Points' into 'A'ja Wilson'."""
-    if not isinstance(title, str):
-        return None
-    s = title.strip()
-    if not s:
-        return None
-
-    # Remove common sportsbook separators/details.
-    s = re.sub(r"(?i)\b(higher|lower|over|under|than|more|less)\b", " ", s)
-    s = re.sub(r"(?i)\b(line|projection|fantasy score|stat)\b", " ", s)
-
-    market_phrases = [
-        "points + rebounds + assists", "pts + rebs + asts", "pts+rebs+asts",
-        "points + rebounds", "pts + rebs", "pts+rebs",
-        "points + assists", "pts + asts", "pts+asts",
-        "rebounds + assists", "rebs + asts", "rebs+asts",
-        "3-pointers made", "3 pointers made", "three pointers made",
-        "made threes", "three pointers", "3pt made", "3pm",
-        "points", "pts", "rebounds", "rebs", "reb", "assists", "asts", "ast",
-        "steals", "stls", "stl", "blocks", "blks", "blk", "pra"
-    ]
-    for phrase in sorted(market_phrases, key=len, reverse=True):
-        s = re.sub(r"(?i)\b" + re.escape(phrase).replace("\\ ", r"\s*") + r"\b", " ", s)
-
-    # Remove line numbers from the title.
-    s = re.sub(r"(?<!\d)\d{1,2}(?:\.5|\.0)?(?!\d)", " ", s)
-
-    # Remove team/event pieces.
-    s = re.split(r"(?i)\s+(?:vs\.?|@)\s+", s)[0]
-    s = s.replace(":", " ")
-    s = " ".join(s.split()).strip(" -|•")
-
-    # Must look like a player name.
-    if 2 <= len(s.split()) <= 4:
-        bad = s.lower()
-        if not any(x in bad for x in ["dota", "gaming", "esports", "team ", " vs ", " @ ", "natus", "vincere"]):
-            return s
-    return None
-
-def title_candidates_from_obj_and_related(obj, idx):
-    candidates = []
-
-    def pull(o):
-        if not isinstance(o, dict):
-            return
-        a = ud_attrs(o)
-        for k in [
-            "title", "display_title", "name", "display_name", "description",
-            "over_under_title", "option_display", "appearance_stat"
-        ]:
-            v = a.get(k)
-            if isinstance(v, str):
-                cleaned = strip_market_words_from_title(v)
-                if cleaned:
-                    candidates.append(cleaned)
-
-    pull(obj)
-    for ref in relationship_refs(obj):
-        ro = idx.get(ref) or idx.get(("", ref[1]))
-        pull(ro)
-        if isinstance(ro, dict):
-            for ref2 in relationship_refs(ro):
-                ro2 = idx.get(ref2) or idx.get(("", ref2[1]))
-                pull(ro2)
-
-    if candidates:
-        return sorted(set(candidates), key=lambda x: (len(x), x))[0]
-    return None
-
-def is_bad_player_like_name(name):
-    low = str(name or "").lower()
-    if any(x in low for x in [
-        "dota", "gaming", "natus", "vincere", "esports", "counter-strike",
-        "cs2", "valorant", "league of legends", " vs ", " vs. ", " @ "
-    ]):
-        return True
-    if ":" in str(name) or len(str(name).split()) > 4 or len(str(name).split()) < 2:
-        return True
-    return False
-
-
-NBA_NAME_BLOCKLIST = {
-    # Common NBA players that should never appear in WNBA board.
-    "victor wembanyama", "nikola jokic", "luka doncic", "shai gilgeous alexander",
-    "lebron james", "stephen curry", "kevin durant", "anthony edwards",
-    "jayson tatum", "jaylen brown", "giannis antetokounmpo", "joel embiid",
-    "jalen brunson", "donovan mitchell", "devin booker", "kyrie irving",
-    "anthony davis", "tyrese haliburton", "ja morant", "trae young",
-    "damian lillard", "paolo banchero", "cade cunningham", "zion williamson",
-    "james harden", "kawhi leonard", "paul george", "lamelo ball",
-    "bam adebayo", "domantas sabonis", "deaaron fox", "chet holmgren",
-    "scottie barnes", "tyrese maxey", "mikal bridges", "jimmy butler",
-    "jamal murray", "rudy gobert", "karl anthony towns", "jaren jackson jr",
-}
-
-WNBA_NAME_ALLOW_HINTS = {
-    # Core WNBA names to protect the fallback parser from NBA slips.
-    "aja wilson", "a ja wilson", "breanna stewart", "sabrina ionescu",
-    "caitlin clark", "angel reese", "napheesa collier", "alyssa thomas",
-    "kelsey plum", "jackie young", "chelsea gray", "arike ogunbowale",
-    "nneka ogwumike", "jewell loyd", "skylar diggins", "kahleah copper",
-    "diana taurasi", "brittney griner", "aliyah boston", "kelsey mitchell",
-    "rhyne howard", "allisha gray", "dearica hamby", "rickea jackson",
-    "azura stevens", "brionna jones", "dewanna bonner", "marina mabrey",
-    "di jonai carrington", "dijonai carrington", "natasha cloud",
-    "natasha howard", "sophie cunningham", "satou sabally", "maddy siegrist",
-    "kayla mcbride", "courtney williams", "alanna smith", "diamond miller",
-    "shakira austin", "brittney sykes", "aaliyah edwards", "elena delle donne",
-    "gabby williams", "nneka ogwumike", "jonquel jones", "betnijah laney",
-    "leonie fiebich", "nyara sabally", "teaira mccowan", "saniya rivers",
-    "paige bueckers", "sonia citron", "kiki iriafen", "hailey van lith",
-    "li yueru", "kate martin", "monique billings", "erica wheeler",
-    "lexie hull", "victoria vivians", "na lyssa smith", "nalyssa smith",
-    "temi fagbenle", "jordin canada", "cheyenne parker", "aari mcdonald",
-    "zhalia mccall", "maya caldwell", "lexie brown", "rae burrell",
-    "natalie achonwa", "elizabeth williams", "moriah jefferson",
-}
-
-# Extra WNBA names added for stricter verified WNBA filtering.
-WNBA_NAME_ALLOW_HINTS.update({
-    "aerial powers", "alexis morris", "alissa pili", "aliyah edwards",
-    "laeticia amihere", "ariel atkins", "brianna turner", "bridget carleton",
-    "carla leite", "celeste taylor", "charisma osborne", "courtney vandersloot",
-    "danielle robinson", "dorka juhasz", "emily engstler", "ezi magbegor",
-    "haley jones", "iliana rupert", "isabelle harrison", "jacy sheldon",
-    "jade melbourne", "janelle salaun", "jessika carter", "jordan horston",
-    "joyner holmes", "julie allemand", "kayla thornton", "kia nurse",
-    "kierstan bell", "lauren cox", "lindsay allen", "liatu king",
-    "michaela onyenwere", "morgan bertsch", "nia coffey", "nia clouden",
-    "odyssey sims", "olivia nelson ododa", "olivia miles", "rachael banham",
-    "rebecca allen", "sam thomas", "sami whitcomb", "shatori walker kimbrough",
-    "sika kone", "sydney colson", "tiffany hayes", "veronica burton",
-    "victoria vivians", "zoe brooks"
-})
-
-
-def is_known_nba_name(name):
-    n = normalize_name(name)
-    if n in NBA_NAME_BLOCKLIST:
-        return True
-    # Obvious NBA-only surname protections for unique names.
-    nba_unique_tokens = ["wembanyama", "jokic", "doncic", "gilgeous", "antetokounmpo", "mitchell"]
-    return any(tok in n for tok in nba_unique_tokens)
-
-def is_likely_wnba_name(name, combined_text=""):
-    n = normalize_name(name)
-    raw = " " + str(combined_text or "").lower() + " "
-    if is_known_nba_name(name):
-        return False
-    if n in WNBA_NAME_ALLOW_HINTS:
-        return True
-    if " wnba" in raw or "women" in raw or "women's" in raw or "basketball_wnba" in raw:
-        return True
-    # If no explicit WNBA marker, do not accept random names from a mixed Underdog payload.
-    return False
-
-
-def extract_dynamic_wnba_names_from_payload(data):
-    """Build WNBA player allowlist from Underdog's own WNBA-linked objects.
-
-    This fixes logs where name/line are found but every row is rejected because
-    the static WNBA list is incomplete.
-    """
-    names = set()
-    objects = flatten_json(data)
-
-    def add_name(v):
-        if not isinstance(v, str):
-            return
-        cleaned = strip_market_words_from_title(v) or v.strip()
-        if not cleaned:
-            return
-        if is_bad_player_like_name(cleaned):
-            return
-        if is_known_nba_name(cleaned):
-            return
-        # Avoid event/team strings
-        low = cleaned.lower()
-        if any(x in low for x in [" vs ", " vs. ", " @ ", "dota", "gaming", "esports"]):
-            return
-        if 2 <= len(cleaned.split()) <= 4:
-            names.add(normalize_name(cleaned))
-
-    for obj in objects:
-        if not isinstance(obj, dict):
-            continue
-        blob = json.dumps(obj, default=str).lower()
-        if not ("wnba" in blob or "women" in blob or "women's" in blob or "basketball_wnba" in blob):
-            continue
-        a = ud_attrs(obj)
-        fn = a.get("first_name")
-        ln = a.get("last_name")
-        if isinstance(fn, str) and isinstance(ln, str):
-            add_name(fn + " " + ln)
-        for k in [
-            "player_name", "athlete_name", "full_name", "display_name", "name",
-            "title", "display_title", "description", "over_under_title", "option_display"
-        ]:
-            add_name(a.get(k))
-    return names
-
-def is_likely_wnba_name_dynamic(name, combined_text="", dynamic_names=None):
-    n = normalize_name(name)
-    raw = " " + str(combined_text or "").lower() + " "
-    if is_known_nba_name(name):
-        return False
-    if n in WNBA_NAME_ALLOW_HINTS:
-        return True
-    if dynamic_names and n in dynamic_names:
-        return True
-    if " wnba" in raw or "women" in raw or "women's" in raw or "basketball_wnba" in raw:
-        return True
-    return False
-
-
-
-
-def stats_df_from_result(data, idx=0):
-    """Safely convert stats.nba.com resultSets into a DataFrame.
-
-    If stats.nba.com times out, blocks, or changes shape, return an empty table
-    instead of crashing the Streamlit app.
-    """
-    try:
-        if not data or not isinstance(data, dict):
-            return pd.DataFrame()
-        result_sets = data.get("resultSets") or data.get("resultsets") or []
-        if not result_sets or idx >= len(result_sets):
-            return pd.DataFrame()
-        result = result_sets[idx]
-        headers = result.get("headers") or []
-        rows = result.get("rowSet") or result.get("rowset") or []
-        if not headers or rows is None:
-            return pd.DataFrame()
-        return pd.DataFrame(rows, columns=headers)
-    except Exception:
-        return pd.DataFrame()
-
-@st.cache_data(ttl=1800, show_spinner=False)
-def get_wnba_player_dashboard(season="2025", last_n="0"):
-    url = f"{NBA_STATS_BASE}/leaguedashplayerstats"
-    params = {
-        "College": "", "Conference": "", "Country": "", "DateFrom": "", "DateTo": "",
-        "Division": "", "DraftPick": "", "DraftYear": "", "GameScope": "",
-        "GameSegment": "", "Height": "", "LastNGames": str(last_n), "LeagueID": WNBA_LEAGUE_ID,
-        "Location": "", "MeasureType": "Base", "Month": "0", "OpponentTeamID": "0",
-        "Outcome": "", "PORound": "0", "PaceAdjust": "N", "PerMode": "PerGame",
-        "Period": "0", "PlayerExperience": "", "PlayerPosition": "", "PlusMinus": "N",
-        "Rank": "N", "Season": season, "SeasonSegment": "", "SeasonType": "Regular Season",
-        "ShotClockRange": "", "StarterBench": "", "TeamID": "0", "TwoWay": "0",
-        "VsConference": "", "VsDivision": "", "Weight": "",
-    }
-    data = safe_get_json(url, params=params, headers=nba_stats_headers(), timeout=8)
-    return stats_df_from_result(data)
-
-
-def nba_stats_headers():
-    """Headers for stats.nba.com / WNBA stats calls.
-
-    Kept as a helper so scoreboard/stat calls do not crash if the endpoint times out.
-    """
-    return {
-        "Host": "stats.nba.com",
-        "Connection": "keep-alive",
-        "Accept": "application/json, text/plain, */*",
-        "x-nba-stats-token": "true",
-        "User-Agent": "Mozilla/5.0",
-        "x-nba-stats-origin": "stats",
-        "Origin": "https://www.wnba.com",
-        "Referer": "https://www.wnba.com/",
-    }
 
 @st.cache_data(ttl=900, show_spinner=False)
-def get_wnba_scoreboard(date_str):
-    url = f"{NBA_STATS_BASE}/scoreboardv2"
-    mmddyyyy = datetime.strptime(date_str, "%Y-%m-%d").strftime("%m/%d/%Y")
-    params = {"DayOffset": "0", "GameDate": mmddyyyy, "LeagueID": WNBA_LEAGUE_ID}
-    data = safe_get_json(url, params=params, headers=nba_stats_headers(), timeout=8)
-    games = stats_df_from_result(data, 0)
-    linescore = stats_df_from_result(data, 1)
-    out = []
-    if games.empty:
-        return out
-    for _, g in games.iterrows():
-        gid = str(g.get("GAME_ID", ""))
-        home_id = g.get("HOME_TEAM_ID")
-        away_id = g.get("VISITOR_TEAM_ID")
-        home_name, away_name = str(home_id), str(away_id)
-        if not linescore.empty and "GAME_ID" in linescore.columns:
-            sub = linescore[linescore["GAME_ID"].astype(str) == gid]
-            for _, lr in sub.iterrows():
-                tid = lr.get("TEAM_ID")
-                abbr = lr.get("TEAM_ABBREVIATION") or lr.get("TEAM_NAME") or ""
-                if str(tid) == str(home_id):
-                    home_name = abbr
-                if str(tid) == str(away_id):
-                    away_name = abbr
-        out.append({"Game ID": gid, "Date": date_str, "Away": away_name, "Home": home_name, "Status": g.get("GAME_STATUS_TEXT", ""), "Time": str(g.get("GAME_DATE_EST", date_str))})
-    return out
+def get_teams() -> pd.DataFrame:
+    data = safe_get_json(f"{ESPN_SITE}/teams", params={"limit": 50}) or {}
+    rows = []
+    sports = data.get("sports") or []
+    for sport in sports:
+        for league in sport.get("leagues", []) or []:
+            for t in league.get("teams", []) or []:
+                team = t.get("team") or t
+                rows.append({
+                    "team_id": str(team.get("id") or ""),
+                    "team": team.get("displayName") or team.get("name"),
+                    "abbr": clean_team_abbr(team.get("abbreviation") or team.get("shortDisplayName")),
+                    "location": team.get("location"),
+                    "color": team.get("color"),
+                })
+    return pd.DataFrame(rows).drop_duplicates(subset=["team_id"]) if rows else pd.DataFrame()
 
-def lookup_player_stat(player_name, stats_df):
-    if stats_df is None or stats_df.empty or not player_name:
-        return None
-    best, best_score = None, 0
-    for _, r in stats_df.iterrows():
-        sc = name_score(player_name, str(r.get("PLAYER_NAME", "")))
-        if sc > best_score:
-            best_score = sc
-            best = r
-    if best is None or best_score < 0.78:
-        return None
-    d = best.to_dict()
-    d["_name_match_score"] = round(best_score, 3)
-    return d
 
-# =========================
-# REAL PROP PARSERS
-# =========================
-def detect_market(text):
-    t = str(text or "").lower().replace("-", " ").replace("_", " ")
-    t = " ".join(t.split())
-    if "fantasy" in t:
-        return None
-    for key, aliases in SUPPORTED_MARKETS.items():
-        for alias in aliases:
-            if alias.lower().replace("-", " ") in t:
-                return key
-    if "pts" in t and "reb" in t and "ast" in t:
-        return "pts_rebs_asts"
-    if "pts" in t and "reb" in t:
-        return "pts_rebs"
-    if "pts" in t and "ast" in t:
-        return "pts_asts"
-    if "reb" in t and "ast" in t:
-        return "rebs_asts"
+@st.cache_data(ttl=900, show_spinner=False)
+def get_team_roster(team_id: str) -> pd.DataFrame:
+    urls = [
+        f"{ESPN_SITE}/teams/{team_id}/roster",
+        f"{ESPN_COMMON}/teams/{team_id}/roster",
+    ]
+    rows = []
+    for url in urls:
+        data = safe_get_json(url, params={"enable": "roster"}) or {}
+        athletes = data.get("athletes") or data.get("team", {}).get("athletes") or []
+        if isinstance(athletes, dict):
+            athletes = athletes.get("items") or []
+        for a in athletes:
+            athlete = a.get("athlete") if isinstance(a, dict) and "athlete" in a else a
+            if not isinstance(athlete, dict):
+                continue
+            pos = athlete.get("position") or {}
+            rows.append({
+                "player_id": str(athlete.get("id") or ""),
+                "player": athlete.get("displayName") or athlete.get("fullName") or athlete.get("name"),
+                "team_id": str(team_id),
+                "position": pos.get("abbreviation") or pos.get("name") or "",
+                "height": athlete.get("height"),
+                "weight": athlete.get("weight"),
+                "status": (athlete.get("status") or {}).get("name") if isinstance(athlete.get("status"), dict) else athlete.get("status"),
+            })
+        if rows:
+            break
+    return pd.DataFrame(rows).drop_duplicates(subset=["player_id"]) if rows else pd.DataFrame()
+
+
+@st.cache_data(ttl=1800, show_spinner=False)
+def get_all_rosters() -> pd.DataFrame:
+    teams = get_teams()
+    frames = []
+    if teams.empty:
+        return pd.DataFrame()
+    for _, t in teams.iterrows():
+        r = get_team_roster(str(t["team_id"]))
+        if not r.empty:
+            r["team"] = t["team"]
+            r["abbr"] = t["abbr"]
+            frames.append(r)
+    return pd.concat(frames, ignore_index=True) if frames else pd.DataFrame()
+
+
+def parse_competitor(comp: Dict[str, Any]) -> Dict[str, Any]:
+    team = comp.get("team") or {}
+    return {
+        "team_id": str(team.get("id") or ""),
+        "team": team.get("displayName") or team.get("name"),
+        "abbr": clean_team_abbr(team.get("abbreviation") or team.get("shortDisplayName")),
+        "home_away": comp.get("homeAway"),
+        "score": safe_float(comp.get("score")),
+        "winner": comp.get("winner"),
+        "record": ", ".join([r.get("summary", "") for r in comp.get("records", []) if r.get("summary")]),
+    }
+
+
+def extract_games(date_strs: List[str]) -> pd.DataFrame:
+    rows = []
+    for ds in date_strs:
+        data = get_scoreboard(ds)
+        for e in data.get("events", []) or []:
+            comp = (e.get("competitions") or [{}])[0]
+            competitors = comp.get("competitors") or []
+            home = next((parse_competitor(c) for c in competitors if c.get("homeAway") == "home"), None)
+            away = next((parse_competitor(c) for c in competitors if c.get("homeAway") == "away"), None)
+            if not home or not away:
+                continue
+            status = comp.get("status") or e.get("status") or {}
+            status_type = status.get("type") or {}
+            rows.append({
+                "date": ds,
+                "event_id": str(e.get("id") or comp.get("id") or ""),
+                "game_time": e.get("date"),
+                "name": e.get("name") or f"{away['abbr']} @ {home['abbr']}",
+                "short_name": e.get("shortName") or f"{away['abbr']} @ {home['abbr']}",
+                "status": status_type.get("description") or status_type.get("name") or "Scheduled",
+                "completed": bool(status_type.get("completed")),
+                "neutral": comp.get("neutralSite", False),
+                "venue": (comp.get("venue") or {}).get("fullName") or "",
+                "home_team": home["team"], "home_abbr": home["abbr"], "home_id": home["team_id"], "home_score": home["score"],
+                "away_team": away["team"], "away_abbr": away["abbr"], "away_id": away["team_id"], "away_score": away["score"],
+                "matchup": f"{away['abbr']} @ {home['abbr']}",
+            })
+    return pd.DataFrame(rows)
+
+
+@st.cache_data(ttl=1800, show_spinner=False)
+def get_player_gamelog(player_id: str, season: int = CURRENT_SEASON) -> pd.DataFrame:
+    urls = [
+        f"{ESPN_COMMON}/athletes/{player_id}/gamelog",
+        f"https://site.web.api.espn.com/apis/common/v3/sports/basketball/wnba/athletes/{player_id}/gamelog",
+    ]
+    data = None
+    for url in urls:
+        data = safe_get_json(url, params={"season": season})
+        if data:
+            break
+    rows = []
+    if not isinstance(data, dict):
+        return pd.DataFrame()
+
+    # ESPN common gamelog usually returns seasonTypes -> categories -> events.
+    events_by_id = {}
+    for ev in (data.get("events") or {}).values() if isinstance(data.get("events"), dict) else data.get("events", []):
+        if isinstance(ev, dict):
+            events_by_id[str(ev.get("id") or ev.get("eventId") or "")] = ev
+
+    def add_row_from_stats(ev_id: str, stat_map: Dict[str, Any], ev_meta: Dict[str, Any]) -> None:
+        def grab(*keys):
+            for k in keys:
+                if k in stat_map:
+                    return safe_float(stat_map[k])
+                for kk, vv in stat_map.items():
+                    if str(kk).lower() == str(k).lower():
+                        return safe_float(vv)
+            return None
+        rows.append({
+            "Date": ev_meta.get("gameDate") or ev_meta.get("date") or ev_meta.get("eventDate"),
+            "EventID": ev_id,
+            "Opponent": ((ev_meta.get("opponent") or {}).get("displayName") if isinstance(ev_meta.get("opponent"), dict) else ev_meta.get("opponent")) or "",
+            "HomeAway": ev_meta.get("homeAway") or "",
+            "MIN": grab("MIN", "min", "minutes"),
+            "PTS": grab("PTS", "points"),
+            "REB": grab("REB", "rebounds", "TOT"),
+            "AST": grab("AST", "assists"),
+            "FGA": grab("FGA", "fieldGoalsAttempted"),
+            "FGM": grab("FGM", "fieldGoalsMade"),
+            "FTA": grab("FTA", "freeThrowsAttempted"),
+            "TOV": grab("TO", "TOV", "turnovers"),
+            "STL": grab("STL", "steals"),
+            "BLK": grab("BLK", "blocks"),
+        })
+
+    # Format A: seasonTypes/categories/events
+    for season_type in data.get("seasonTypes", []) or []:
+        for cat in season_type.get("categories", []) or []:
+            for ev in cat.get("events", []) or []:
+                ev_id = str(ev.get("eventId") or ev.get("id") or "")
+                stats = ev.get("stats") or ev.get("stat") or {}
+                ev_meta = events_by_id.get(ev_id, ev)
+                if isinstance(stats, dict):
+                    add_row_from_stats(ev_id, stats, ev_meta)
+                elif isinstance(stats, list):
+                    # Sometimes stats are list values with labels held elsewhere. Use common basketball order fallback.
+                    labels = ["MIN", "FGM", "FGA", "FG%", "3PM", "3PA", "3P%", "FTM", "FTA", "FT%", "REB", "AST", "BLK", "STL", "PF", "TOV", "PTS"]
+                    stat_map = {labels[i]: stats[i] for i in range(min(len(labels), len(stats)))}
+                    add_row_from_stats(ev_id, stat_map, ev_meta)
+
+    # Format B: direct events list with stats.
+    if not rows:
+        for ev in data.get("events", []) if isinstance(data.get("events"), list) else []:
+            ev_id = str(ev.get("id") or ev.get("eventId") or "")
+            stats = ev.get("stats") or {}
+            if isinstance(stats, dict):
+                add_row_from_stats(ev_id, stats, ev)
+
+    df = pd.DataFrame(rows)
+    if df.empty:
+        return df
+    for col in ["MIN", "PTS", "REB", "AST", "FGA", "FGM", "FTA", "TOV", "STL", "BLK"]:
+        df[col] = pd.to_numeric(df.get(col), errors="coerce")
+    df = df.dropna(subset=["MIN", "PTS", "REB", "AST"], how="all")
+    # Newest first if date parses.
+    try:
+        df["_date"] = pd.to_datetime(df["Date"], errors="coerce")
+        df = df.sort_values("_date", ascending=False).drop(columns=["_date"])
+    except Exception:
+        pass
+    return df.drop_duplicates(subset=["EventID", "PTS", "REB", "AST"], keep="first")
+
+
+@st.cache_data(ttl=1200, show_spinner=False)
+def get_event_summary(event_id: str) -> Dict[str, Any]:
+    return safe_get_json(f"{ESPN_SITE}/summary", params={"event": event_id}) or {}
+
+
+def boxscore_player_rows(event_id: str) -> pd.DataFrame:
+    data = get_event_summary(event_id)
+    rows = []
+    box = data.get("boxscore") or {}
+    for team_block in box.get("players", []) or []:
+        team = team_block.get("team") or {}
+        abbr = clean_team_abbr(team.get("abbreviation"))
+        for stat_group in team_block.get("statistics", []) or []:
+            labels = stat_group.get("labels") or []
+            if not labels:
+                continue
+            for athlete in stat_group.get("athletes", []) or []:
+                a = athlete.get("athlete") or {}
+                stats = athlete.get("stats") or []
+                m = {labels[i]: stats[i] for i in range(min(len(labels), len(stats)))}
+                rows.append({
+                    "player_id": str(a.get("id") or ""),
+                    "player": a.get("displayName") or a.get("fullName") or a.get("shortName"),
+                    "team_abbr": abbr,
+                    "MIN": safe_float(m.get("MIN")),
+                    "PTS": safe_float(m.get("PTS")),
+                    "REB": safe_float(m.get("REB")),
+                    "AST": safe_float(m.get("AST")),
+                    "FGA": safe_float(m.get("FGA")),
+                    "FGM": safe_float(m.get("FGM")),
+                    "FTA": safe_float(m.get("FTA")),
+                    "TOV": safe_float(m.get("TO") or m.get("TOV")),
+                })
+    return pd.DataFrame(rows)
+
+# ============================================================
+# PROP LINES — UNDERDOG + PRIZEPICKS
+# ============================================================
+def market_from_text(text: Any) -> Optional[str]:
+    t = normalize_name(text).replace(" ", " ")
+    raw = str(text or "").lower()
+    for k, v in PROP_ALIASES.items():
+        if k in raw:
+            # Avoid combos for now.
+            if any(combo in raw for combo in ["pra", "pts+reb", "points + rebounds", "rebounds + assists", "fantasy"]):
+                return None
+            return v
     return None
 
-def extract_number_line(obj):
-    for key in ["stat_value", "line", "value", "over_under", "target", "total", "points", "line_score"]:
-        f = safe_float(obj.get(key) if isinstance(obj, dict) else None)
-        if f is not None:
-            return f
-    return None
 
-def clean_prop_rows(rows):
-    out, seen = [], set()
-    for r in rows or []:
-        name = str(r.get("Player") or "").strip()
-        market = r.get("Market")
-        line = safe_float(r.get("Line"))
-        if not name or not market or line is None:
-            continue
-        key = (normalize_name(name), market, line, r.get("Source"))
-        if key in seen:
-            continue
-        seen.add(key)
-        out.append(r)
-    return out
+def is_wnba_text(text: Any) -> bool:
+    t = str(text or "").lower()
+    return "wnba" in t or "women" in t or "basketball" in t
 
-
-def should_accept_underdog_wnba_row(name, combined_text="", dynamic_names=None):
-    """Strict WNBA-only final guard v3.2.
-
-    Accept only explicit/dynamic/static WNBA names. No generic basketball fallback.
-    """
-    if is_bad_player_like_name(name):
-        return False
-    if is_known_nba_name(name):
-        return False
-
-    n = normalize_name(name)
-    raw = " " + str(combined_text or "").lower() + " "
-
-    if any(x in raw for x in [
-        " dota", "esports", "counter-strike", " cs2", "valorant",
-        "league of legends", "natus vincere", "xtreme gaming",
-        " nba", "basketball_nba", " men basketball", " mens basketball"
-    ]):
-        return False
-
-    if n in WNBA_NAME_ALLOW_HINTS:
-        return True
-    if dynamic_names and n in dynamic_names:
-        return True
-    if " wnba" in raw or " women's" in raw or " women " in raw or "basketball_wnba" in raw:
-        return True
-
-    return False
-
-
-def underdog_text_is_wnba(text, payload_has_wnba=False):
-    """WNBA sport filter used before final player-name guard.
-
-    Keeps obvious wrong sports/NBA rows out, while allowing Underdog's nested
-    WNBA rows to continue to the stricter final WNBA player-name guard.
-    """
-    raw = " " + str(text or "").lower() + " "
-
-    if has_bad_cross_sport_terms(raw):
-        return False
-    if object_mentions_other_basketball_league(raw):
-        return False
-    if any(x in raw for x in [
-        " wembanyama", " donovan mitchell", " lebron ", " doncic",
-        " jokic", " gilgeous", " curry", " antetokounmpo"
-    ]):
-        return False
-
-    if " wnba" in raw or " women's" in raw or " women " in raw or "basketball_wnba" in raw:
-        return True
-
-    # Let payload-level WNBA rows pass only to the strict final guard.
-    if payload_has_wnba:
-        basketball_markers = [" points", " rebounds", " assists", " pts", " rebs", " asts", " 3pt", "3pm", " steals", " blocks"]
-        return any(x in raw for x in basketball_markers)
-
-    return False
 
 @st.cache_data(ttl=120, show_spinner=False)
-def fetch_underdog_wnba_props():
-    """Relationship-aware Underdog WNBA parser.
+def fetch_prizepicks_lines() -> pd.DataFrame:
+    data = safe_get_json(PRIZEPICKS_URL, timeout=18)
+    if not isinstance(data, dict):
+        return pd.DataFrame()
+    included = data.get("included") or []
+    players: Dict[str, Dict[str, Any]] = {}
+    for inc in included:
+        if inc.get("type") == "new_player":
+            attrs = inc.get("attributes") or {}
+            players[str(inc.get("id"))] = {
+                "player": attrs.get("name") or attrs.get("display_name"),
+                "team": attrs.get("team"),
+                "league": attrs.get("league"),
+                "position": attrs.get("position"),
+            }
+    rows = []
+    for item in data.get("data", []) or []:
+        attrs = item.get("attributes") or {}
+        rel = item.get("relationships") or {}
+        p_id = None
+        try:
+            p_id = str(rel.get("new_player", {}).get("data", {}).get("id"))
+        except Exception:
+            p_id = None
+        p = players.get(str(p_id), {})
+        league = str(attrs.get("league") or p.get("league") or "").upper()
+        stat_type = attrs.get("stat_type") or attrs.get("statType") or attrs.get("name")
+        market = market_from_text(stat_type)
+        if league != "WNBA" or market is None:
+            continue
+        line = safe_float(attrs.get("line_score") or attrs.get("line"))
+        if line is None:
+            continue
+        rows.append({
+            "Player": p.get("player") or attrs.get("description"),
+            "Market": market,
+            "Line": line,
+            "Source": "PrizePicks",
+            "Price": DEFAULT_ODDS,
+            "Team": p.get("team"),
+            "Raw": stat_type,
+        })
+    return pd.DataFrame(rows).drop_duplicates(subset=["Player", "Market", "Source"]) if rows else pd.DataFrame()
 
-    v2.5 fix:
-    Underdog separates the player, market, league, and line across related objects.
-    The old parser saw payload_has_wnba=True but found OK_NO_WNBA_ROWS because
-    no single flattened object had all fields. This version resolves relationships.
+
+
+@st.cache_data(ttl=90, show_spinner=False)
+def fetch_underdog_lines() -> pd.DataFrame:
+    """Verified Underdog Matching 2.0.
+
+    Goals:
+    - WNBA-only rows. Reject NBA/NCAAB/NFL contamination.
+    - Market lock to player Points/Rebounds/Assists only.
+    - Store a debug table for every possible UD prop row seen.
+    - Return only rows with a real player, real market, and real line.
     """
-    all_rows = []
+    rows: List[Dict[str, Any]] = []
+    debug: List[Dict[str, Any]] = []
+
+    def blob_text(obj: Any, limit: int = 9000) -> str:
+        try:
+            return json.dumps(obj, ensure_ascii=False).lower()[:limit]
+        except Exception:
+            return str(obj).lower()[:limit]
+
+    def strict_market_from_ud_text(text: Any) -> Optional[str]:
+        raw = str(text or "").lower()
+        # hard reject combo/discount/fantasy/stat mashups
+        bad = [
+            "pra", "points+rebounds", "points + rebounds", "pts+reb", "pts + reb",
+            "rebounds+assists", "rebounds + assists", "reb+ast", "reb + ast",
+            "points+assists", "points + assists", "pts+ast", "pts + ast",
+            "fantasy", "combo", "rival", "special", "discount", "double double",
+            "triple double", "made threes", "3-pointers", "turnovers", "steals", "blocks"
+        ]
+        if any(x in raw for x in bad):
+            return None
+        # exact-ish market lock
+        if re.search(r"\b(player\s+)?(points|pts)\b", raw):
+            return "Points"
+        if re.search(r"\b(player\s+)?(rebounds|rebs|reb)\b", raw):
+            return "Rebounds"
+        if re.search(r"\b(player\s+)?(assists|asts|ast)\b", raw):
+            return "Assists"
+        return None
+
+    def is_strict_wnba(obj: Any) -> bool:
+        b = blob_text(obj)
+        # WNBA accepted; NBA/NCAAB/etc rejected unless WNBA explicitly present and no male NBA markers dominate.
+        if "wnba" not in b and "women" not in b:
+            return False
+        bad = ["\"nba\"", " ncaab", "college basketball", "mens", "men's", " nfl", " mlb", " nhl"]
+        if "wnba" in b:
+            return True
+        return not any(x in b for x in bad)
+
+    def extract_line(d: Dict[str, Any]) -> Optional[float]:
+        for k in ["line", "stat_value", "over_under_line", "value", "line_score", "target", "over_under_value"]:
+            if k in d:
+                v = safe_float(d.get(k))
+                if v is not None and 0 <= v <= 60:
+                    return v
+        return None
+
+    def clean_ud_player_name(name: Any, market: Optional[str]) -> str:
+        txt = str(name or "").strip()
+        # Remove market and side text embedded in some titles.
+        kill = ["Higher", "Lower", "Over", "Under", "Points", "Rebounds", "Assists", "PTS", "REB", "AST", "WNBA"]
+        for word in kill:
+            txt = re.sub(rf"\b{re.escape(word)}\b", " ", txt, flags=re.I)
+        txt = re.sub(r"\s+", " ", txt).strip(" -|•:")
+        return txt
 
     for url in UNDERDOG_URLS:
-        data = safe_get_json(url, timeout=12)
+        data = safe_get_json(url, timeout=18)
         if not data:
             continue
+        flat = flatten_json(data)
 
-        payload_text = json.dumps(data, default=str).lower()
-        payload_has_wnba = ("wnba" in payload_text) or ("women" in payload_text) or ("women's" in payload_text)
-        idx = build_underdog_id_index(data)
-        objects = flatten_json(data)
-        dynamic_wnba_names = extract_dynamic_wnba_names_from_payload(data)
-        rows = []
-        debug_candidates = 0
-        debug_market = 0
-        debug_name = 0
-        debug_line = 0
-        debug_rejected_name = 0
-
-        for obj in objects:
-            if not isinstance(obj, dict):
+        player_map: Dict[str, str] = {}
+        for d in flat:
+            if not isinstance(d, dict):
                 continue
-
-            combined = combine_obj_and_related_text(obj, idx, depth=2)
-            combined_low = combined.lower()
-
-            # Must pass WNBA/cross-sport protection.
-            if not underdog_text_is_wnba(combined_low, payload_has_wnba=payload_has_wnba):
-                continue
-            debug_candidates += 1
-
-            market = detect_market(combined)
-            if market is None:
-                continue
-            debug_market += 1
-
-            name = candidate_player_name_from_text_and_related(obj, idx)
-            if not name:
-                continue
-            debug_name += 1
-
-            raw_line = extract_underdog_line_from_obj_or_related(obj, idx, market=market, combined_text=combined)
-            line = sane_wnba_line(market, raw_line)
-            if line is None:
-                continue
-            debug_line += 1
-
-            prop_date = parse_prop_date_from_text_or_obj(obj)
-            price = -110
-            a = ud_attrs(obj)
-            for pk in ["american_price", "price", "odds"]:
-                p = safe_float(a.get(pk))
-                if p is not None and -10000 < p < 10000:
-                    price = p
-                    break
-
-            # Final WNBA-only safety: reject non-player/event/team/NBA titles.
-            if not should_accept_underdog_wnba_row(name, combined, dynamic_wnba_names):
-                debug_rejected_name += 1
-                continue
-
-            rows.append({
-                "Player": name,
-                "Market": market,
-                "Market Label": MARKET_LABELS.get(market, market),
-                "Line": float(line),
-                "Source": "Underdog",
-                "Price": price,
-                "Raw Market": combined[:180],
-                "Real Line": True,
-                "Prop Date": prop_date,
-                "Game Day": day_label_from_date(prop_date),
-                "Parser Mode": "relationship-aware-v2.5",
-            })
-
-        rows = clean_prop_rows(rows)
-
-        # Final cleanup: remove known NBA/esports leaks before showing the board.
-        rows = [
-            rr for rr in rows
-            if not is_known_nba_name(rr.get("Player"))
-            and not is_bad_player_like_name(rr.get("Player"))
-            and should_accept_underdog_wnba_row(rr.get("Player"), rr.get("Raw Market", ""), dynamic_wnba_names)
-        ]
-
-        # Debug sample: if we found names/lines but rejected all, show why.
-        if not rows and (debug_market > 0 or debug_name > 0):
+            name = d.get("display_name") or d.get("full_name") or d.get("name") or d.get("title")
+            if d.get("first_name") or d.get("last_name"):
+                name = f"{d.get('first_name','')} {d.get('last_name','')}".strip()
+            ids = [d.get("id"), d.get("player_id"), d.get("appearance_id")]
             try:
-                sample_text = ""
-                for obj2 in objects[:1200]:
-                    c2 = combine_obj_and_related_text(obj2, idx, depth=1)
-                    nm2 = candidate_player_name_from_text_and_related(obj2, idx)
-                    mk2 = detect_market(c2)
-                    ln2 = sane_wnba_line(mk2, extract_underdog_line_from_obj_or_related(obj2, idx, market=mk2, combined_text=c2)) if mk2 else None
-                    if mk2 and nm2:
-                        sample_text = (
-                            f"dynamic_names={len(dynamic_wnba_names)} | sample_name={nm2} | "
-                            f"market={mk2} | line={ln2} | bad_name={is_bad_player_like_name(nm2)} | "
-                            f"nba_name={is_known_nba_name(nm2)} | accept={should_accept_underdog_wnba_row(nm2, c2, dynamic_wnba_names)} | "
-                            f"sample_text={c2[:420]}"
-                        )
-                        break
-                if sample_text:
-                    log_source_request(url, "DEBUG_REJECT_SAMPLE", sample_text)
-            except Exception as e:
-                log_source_request(url, "DEBUG_REJECT_SAMPLE_ERROR", str(e))
-
-        if rows:
-            all_rows.extend(rows)
-            log_source_request(
-                url,
-                "OK",
-                f"{len(rows)} WNBA props parsed relationship-aware | candidates={debug_candidates}, market={debug_market}, name={debug_name}, line={debug_line}, rejected_name={debug_rejected_name}, dynamic_names={len(dynamic_wnba_names)}, objects={len(objects)}"
-            )
-            break
-        else:
-            log_source_request(
-                url,
-                "OK_NO_WNBA_ROWS",
-                f"payload_has_wnba={payload_has_wnba}, candidates={debug_candidates}, market={debug_market}, name={debug_name}, line={debug_line}, rejected_name={debug_rejected_name}, dynamic_names={len(dynamic_wnba_names)}, objects={len(objects)}"
-            )
-
-    return clean_prop_rows(all_rows)
-
-
-@st.cache_data(ttl=180, show_spinner=False)
-def fetch_prizepicks_wnba_props():
-    data = safe_get_json(PRIZEPICKS_URL, timeout=8)
-    if not data or not isinstance(data, dict):
-        return []
-    included = data.get("included", [])
-    players = {}
-    for x in included:
-        if isinstance(x, dict):
-            attrs = x.get("attributes", {}) or {}
-            if x.get("type") in ["new_player", "player"]:
-                players[str(x.get("id"))] = attrs.get("name") or attrs.get("display_name")
-    rows = []
-    for item in data.get("data", []):
-        attrs = item.get("attributes", {}) or {}
-        rel = item.get("relationships", {}) or {}
-        blob = json.dumps(item, default=str).lower()
-        if "wnba" not in blob:
-            continue
-        market = detect_market(attrs.get("stat_type") or attrs.get("description") or blob)
-        line = safe_float(attrs.get("line_score"))
-        if market is None or line is None:
-            continue
-        player_name = attrs.get("name")
-        if not player_name:
-            try:
-                player_id = rel.get("new_player", {}).get("data", {}).get("id")
-                player_name = players.get(str(player_id))
+                ids.append((d.get("appearance") or {}).get("id"))
             except Exception:
                 pass
-        if player_name:
-            rows.append({
-                "Player": player_name,
+            if name:
+                for pid in ids:
+                    if pid is not None:
+                        player_map[str(pid)] = str(name)
+
+        for d in flat:
+            if not isinstance(d, dict):
+                continue
+            text_parts = []
+            for k in ["stat", "stat_type", "stat_type_name", "display_stat", "title", "over_under", "appearance_stat", "description", "name"]:
+                if k in d:
+                    text_parts.append(str(d.get(k)))
+            stat_text = " ".join(text_parts)
+            market = strict_market_from_ud_text(stat_text)
+            line = extract_line(d)
+            wnba_ok = is_strict_wnba(d)
+
+            raw_name = d.get("player_name") or d.get("display_name") or d.get("player") or d.get("athlete") or d.get("title") or d.get("name")
+            for key in ["player_id", "appearance_id", "over_under_id", "appearance_stat_id"]:
+                if (not raw_name or str(raw_name).strip() == "") and d.get(key) is not None:
+                    raw_name = player_map.get(str(d.get(key)))
+            player = clean_ud_player_name(raw_name, market)
+
+            accepted = bool(wnba_ok and market is not None and line is not None and player and len(player.split()) >= 2)
+            debug.append({
+                "Accepted": accepted,
+                "URL": url,
+                "Player Raw": str(raw_name)[:120],
+                "Player Clean": player,
                 "Market": market,
-                "Market Label": MARKET_LABELS.get(market, market),
                 "Line": line,
-                "Source": "PrizePicks",
-                "Price": -110,
-                "Raw Market": str(attrs.get("stat_type", ""))[:140],
-                "Real Line": True,
-                "Prop Date": parse_prop_date_from_text_or_obj(item),
-                "Game Day": day_label_from_date(parse_prop_date_from_text_or_obj(item)),
+                "WNBA Filter": wnba_ok,
+                "Raw Market Text": stat_text[:220],
+                "Reject Reason": "" if accepted else (
+                    "not WNBA" if not wnba_ok else "bad market" if market is None else "bad line" if line is None else "bad player"
+                ),
             })
-    return clean_prop_rows(rows)
+            if not accepted:
+                continue
+            rows.append({
+                "Player": player,
+                "Market": market,
+                "Line": float(line),
+                "Source": "Underdog",
+                "Price": DEFAULT_ODDS,
+                "Team": d.get("team") or d.get("team_abbr") or d.get("team_name"),
+                "Raw": stat_text[:160],
+                "Verified": True,
+            })
 
-def fetch_all_real_wnba_props(source_choice):
-    rows = []
-    if source_choice in ["Underdog first", "Underdog only", "All available"]:
-        rows.extend(fetch_underdog_wnba_props())
-    if source_choice in ["PrizePicks backup only", "All available"] or (not rows and source_choice == "Underdog first"):
-        rows.extend(fetch_prizepicks_wnba_props())
-    return clean_prop_rows(rows)
+        if rows:
+            break
 
-# =========================
-# LEARNING / CLV
-# =========================
-def player_market_key(player, market):
-    return f"{normalize_name(player)}::{market}"
+    try:
+        save_json(UNDERDOG_DEBUG_FILE, debug[-1500:])
+    except Exception:
+        pass
 
-def apply_learning(player, market, proj):
-    data = load_json(LEARN_FILE, {})
-    rec = data.get(player_market_key(player, market), {})
-    scale = safe_float(rec.get("scale"), 1.0) or 1.0
-    samples = safe_int(rec.get("samples"), 0) or 0
-    residual = safe_float(rec.get("avg_residual"), 0.0) or 0.0
-    if samples < LEARNING_MIN_SAMPLES:
-        return proj, scale, samples, "Learning warming up"
-    return (proj * scale) + clamp(residual * 0.25, -1.25, 1.25), scale, samples, f"Learning x{scale:.3f}, residual {residual:+.2f}, n={samples}"
+    if not rows:
+        return pd.DataFrame(columns=["Player", "Market", "Line", "Source", "Price", "Team", "Raw", "Verified"])
+    out = pd.DataFrame(rows)
+    out["_name"] = out["Player"].apply(normalize_name)
+    out = out.drop_duplicates(subset=["_name", "Market", "Source"], keep="first").drop(columns=["_name"])
+    return out
 
-def update_learning(player, market, projected, actual):
-    data = load_json(LEARN_FILE, {})
-    key = player_market_key(player, market)
-    rec = data.get(key, {"scale": 1.0, "samples": 0, "avg_residual": 0.0})
-    projected, actual = safe_float(projected), safe_float(actual)
-    if projected is None or projected <= 0 or actual is None:
-        return rec
-    old_scale = safe_float(rec.get("scale"), 1.0) or 1.0
-    old_samples = safe_int(rec.get("samples"), 0) or 0
-    old_resid = safe_float(rec.get("avg_residual"), 0.0) or 0.0
-    err_pct = clamp((actual - projected) / max(projected, 1.0), -0.40, 0.40)
-    resid = actual - projected
-    rec.update({
-        "scale": clamp(old_scale * (1 + LEARNING_RATE * err_pct), LEARNING_SCALE_MIN, LEARNING_SCALE_MAX),
-        "samples": old_samples + 1,
-        "avg_residual": round(((old_resid * old_samples) + resid) / max(old_samples + 1, 1), 3),
-        "last_error_pct": round(err_pct, 4),
-        "last_projected": projected,
-        "last_actual": actual,
-        "updated_at": now_iso(),
-    })
-    data[key] = rec
-    save_json(LEARN_FILE, data)
-    return rec
 
-def update_clv_snapshot(player, market, source, line):
+def fetch_all_prop_lines() -> pd.DataFrame:
+    frames = []
+    pp = fetch_prizepicks_lines()
+    ud = fetch_underdog_lines()
+    if not pp.empty:
+        frames.append(pp)
+    if not ud.empty:
+        frames.append(ud)
+    if frames:
+        return pd.concat(frames, ignore_index=True).drop_duplicates(subset=["Player", "Market", "Source"])
+    return pd.DataFrame(columns=["Player", "Market", "Line", "Source", "Price", "Team", "Raw"])
+
+
+def best_line_for_player(player: str, market: str, lines: pd.DataFrame, preferred: str = "Underdog") -> Optional[Dict[str, Any]]:
+    """Return a real vendor line only when the player+market match is strong.
+
+    This intentionally shows NO UD LINE / NO REAL LINE instead of forcing a weak match.
+    """
+    if lines.empty:
+        return None
+    candidates = lines[lines["Market"].eq(market)].copy()
+    if candidates.empty:
+        return None
+    candidates["score"] = candidates["Player"].apply(lambda x: name_score(player, x))
+    # Underdog must be stricter because public feeds can contain abbreviations and stale titles.
+    candidates["min_score"] = candidates["Source"].astype(str).str.lower().map(lambda s: 0.90 if s == "underdog" else 0.86)
+    candidates = candidates[candidates["score"] >= candidates["min_score"]].sort_values(["score", "Source"], ascending=[False, True])
+    if candidates.empty:
+        return None
+    pref = candidates[candidates["Source"].str.lower().eq(preferred.lower())]
+    row = pref.iloc[0] if not pref.empty else candidates.iloc[0]
+    return row.to_dict()
+
+
+# ============================================================
+# INJURY RIPPLE + DEFENSE VS POSITION 2.0
+# ============================================================
+def normalize_injury_status(status: Any) -> str:
+    t = str(status or "").strip().upper()
+    if not t:
+        return "ACTIVE"
+    if t in ["OUT", "INACTIVE", "INJURED"] or "OUT" in t:
+        return "OUT"
+    if t in ["QUESTIONABLE", "Q", "GTD", "GAME TIME DECISION"] or "QUESTION" in t or "GTD" in t:
+        return "QUESTIONABLE"
+    if "LIMIT" in t or "RESTRICT" in t:
+        return "MINUTES LIMIT"
+    return t
+
+
+def sanitize_injury_controls(df: pd.DataFrame) -> pd.DataFrame:
+    cols = ["Player", "Team", "Status", "Minutes Limit", "Team ML Adj", "Notes"]
+    if df is None or df.empty:
+        return pd.DataFrame(columns=cols)
+    out = df.copy()
+    for c in cols:
+        if c not in out.columns:
+            out[c] = "" if c not in ["Minutes Limit", "Team ML Adj"] else None
+    out = out[cols].copy()
+    out["Player"] = out["Player"].fillna("").astype(str)
+    out["Team"] = out["Team"].fillna("").astype(str).apply(clean_team_abbr)
+    out["Status"] = out["Status"].fillna("ACTIVE").apply(normalize_injury_status)
+    out["Minutes Limit"] = pd.to_numeric(out["Minutes Limit"], errors="coerce")
+    out["Team ML Adj"] = pd.to_numeric(out["Team ML Adj"], errors="coerce").fillna(0.0)
+    out = out[(out["Player"].str.strip() != "") | (out["Team"].str.strip() != "")].copy()
+    return out
+
+
+def injury_row_for_player(player: str, team: str, injury_df: pd.DataFrame) -> Optional[Dict[str, Any]]:
+    if injury_df is None or injury_df.empty:
+        return None
+    team = clean_team_abbr(team)
+    df = injury_df.copy()
+    df["_team_ok"] = df["Team"].astype(str).apply(clean_team_abbr).eq(team) | df["Team"].astype(str).eq("")
+    df["_score"] = df["Player"].apply(lambda x: name_score(player, x) if str(x).strip() else 0.0)
+    df = df[(df["_team_ok"]) & (df["_score"] >= 0.88)].sort_values("_score", ascending=False)
+    if df.empty:
+        return None
+    return df.iloc[0].drop(labels=["_team_ok", "_score"]).to_dict()
+
+
+def team_injury_ripple(team: str, injury_df: pd.DataFrame) -> Dict[str, float]:
+    if injury_df is None or injury_df.empty:
+        return {"out_count": 0, "q_count": 0, "limit_count": 0, "teammate_min_boost": 0.0, "usage_boost": 1.0, "ml_adj": 0.0}
+    team = clean_team_abbr(team)
+    df = injury_df[injury_df["Team"].astype(str).apply(clean_team_abbr).eq(team)].copy()
+    out_count = int(df["Status"].eq("OUT").sum()) if not df.empty else 0
+    q_count = int(df["Status"].eq("QUESTIONABLE").sum()) if not df.empty else 0
+    limit_count = int(df["Status"].eq("MINUTES LIMIT").sum()) if not df.empty else 0
+    manual_ml = float(pd.to_numeric(df.get("Team ML Adj", pd.Series(dtype=float)), errors="coerce").fillna(0).sum()) if not df.empty else 0.0
+    # Default team penalty in projected margin points. Manual value stacks on top.
+    ml_adj = manual_ml - (3.5 * out_count) - (1.25 * q_count) - (1.75 * limit_count)
+    min_boost = clamp(out_count * 1.7 + q_count * 0.55 + limit_count * 0.75, 0.0, 4.5)
+    usage_boost = clamp(1.0 + out_count * 0.025 + q_count * 0.010 + limit_count * 0.012, 1.0, 1.10)
+    return {"out_count": out_count, "q_count": q_count, "limit_count": limit_count, "teammate_min_boost": min_boost, "usage_boost": usage_boost, "ml_adj": ml_adj}
+
+
+def apply_player_injury_adjustment(player: str, team: str, exp_min: float, injury_df: pd.DataFrame) -> Tuple[float, str, int, str]:
+    """Apply direct player injury control and teammate ripple. Returns minutes, risk, confidence penalty, note."""
+    risk = "ACTIVE"
+    penalty = 0
+    notes: List[str] = []
+    row = injury_row_for_player(player, team, injury_df)
+    if row:
+        status = normalize_injury_status(row.get("Status"))
+        limit = safe_float(row.get("Minutes Limit"))
+        if status == "OUT":
+            exp_min = 0.0
+            risk = "OUT_MANUAL"
+            penalty += 60
+            notes.append("Manual OUT")
+        elif status == "QUESTIONABLE":
+            exp_min *= 0.82
+            risk = "QUESTIONABLE_MANUAL"
+            penalty += 18
+            notes.append("Manual QUESTIONABLE")
+        elif status == "MINUTES LIMIT":
+            if limit is not None:
+                exp_min = min(exp_min, limit)
+            else:
+                exp_min *= 0.78
+            risk = "MINUTES_LIMIT_MANUAL"
+            penalty += 24
+            notes.append("Manual MINUTES LIMIT")
+    ripple = team_injury_ripple(team, injury_df)
+    # Teammate redistribution: only players not directly marked OUT get extra volume.
+    if not row or normalize_injury_status(row.get("Status")) != "OUT":
+        if ripple["teammate_min_boost"] > 0:
+            exp_min += ripple["teammate_min_boost"]
+            notes.append(f"Teammate ripple +{ripple['teammate_min_boost']:.1f} min")
+    return float(clamp(exp_min, 0, 42)), risk, penalty, "; ".join(notes) if notes else "No manual injury adjustment"
+
+
+@st.cache_data(ttl=600, show_spinner=False)
+def build_defense_vs_position() -> Dict[str, Dict[str, Dict[str, float]]]:
+    """Estimate opponent allowed PTS/REB/AST to Guard/Wing/Post from recent ESPN boxscores."""
+    today = california_now().date()
+    date_list = [(today - timedelta(days=i)).strftime("%Y-%m-%d") for i in range(1, 22)]
+    rosters = get_all_rosters()
+    pos_map: Dict[Tuple[str, str], str] = {}
+    if not rosters.empty:
+        for _, r in rosters.iterrows():
+            pos_map[(clean_team_abbr(r.get("team_abbr")), normalize_name(r.get("player")))] = position_bucket(r.get("position"))
+    agg: Dict[str, Dict[str, Dict[str, List[float]]]] = {}
+    for ds in date_list:
+        gdf = extract_games([ds])
+        if gdf.empty:
+            continue
+        for _, g in gdf.iterrows():
+            if not bool(g.get("completed")):
+                continue
+            box = fetch_event_boxscore(str(g.get("event_id")))
+            if box.empty:
+                continue
+            for _, pr in box.iterrows():
+                team = clean_team_abbr(pr.get("team_abbr"))
+                if team == clean_team_abbr(g.get("home_abbr")):
+                    opp = clean_team_abbr(g.get("away_abbr"))
+                elif team == clean_team_abbr(g.get("away_abbr")):
+                    opp = clean_team_abbr(g.get("home_abbr"))
+                else:
+                    continue
+                bucket = pos_map.get((team, normalize_name(pr.get("player"))), "Wing")
+                agg.setdefault(opp, {}).setdefault(bucket, {"Points": [], "Rebounds": [], "Assists": []})
+                agg[opp][bucket]["Points"].append(safe_float(pr.get("PTS"), 0.0) or 0.0)
+                agg[opp][bucket]["Rebounds"].append(safe_float(pr.get("REB"), 0.0) or 0.0)
+                agg[opp][bucket]["Assists"].append(safe_float(pr.get("AST"), 0.0) or 0.0)
+    out: Dict[str, Dict[str, Dict[str, float]]] = {}
+    for opp, by_pos in agg.items():
+        out[opp] = {}
+        for bucket, mkts in by_pos.items():
+            out[opp][bucket] = {}
+            for market, vals in mkts.items():
+                # Per player appearance allowed by role. Baselines handled in matchup function.
+                out[opp][bucket][market] = float(np.mean(vals)) if vals else np.nan
+                out[opp][bucket][f"{market}_n"] = float(len(vals))
+    return out
+
+# ============================================================
+# WNBA PROJECTION ENGINES
+# ============================================================
+def weighted_recent(series: pd.Series, default: Optional[float] = None) -> Optional[float]:
+    vals = pd.to_numeric(series, errors="coerce").dropna().tolist()
+    if not vals:
+        return default
+    l3 = float(np.mean(vals[:3])) if len(vals[:3]) else None
+    l5 = float(np.mean(vals[:5])) if len(vals[:5]) else None
+    l10 = float(np.mean(vals[:10])) if len(vals[:10]) else None
+    parts = []
+    if l3 is not None: parts.append((l3, 0.55))
+    if l5 is not None: parts.append((l5, 0.30))
+    if l10 is not None: parts.append((l10, 0.15))
+    total = sum(w for _, w in parts)
+    return sum(v * w for v, w in parts) / total if total else default
+
+
+def position_bucket(pos: Any) -> str:
+    p = str(pos or "").upper()
+    if p in ["PG", "SG", "G"]:
+        return "Guard"
+    if p in ["SF", "F", "GF"]:
+        return "Wing"
+    if p in ["PF", "C", "FC"]:
+        return "Post"
+    return "Wing"
+
+
+def minutes_engine(logs: pd.DataFrame, status: str = "") -> Dict[str, Any]:
+    if logs.empty:
+        return {"expected_minutes": 18.0, "confidence": 35, "risk": "UNKNOWN", "note": "No ESPN game log; fallback minutes"}
+    mins = pd.to_numeric(logs["MIN"], errors="coerce").dropna()
+    if mins.empty:
+        return {"expected_minutes": 18.0, "confidence": 35, "risk": "UNKNOWN", "note": "No minute data; fallback"}
+    exp_min = weighted_recent(mins, float(mins.mean())) or 18.0
+    last3 = mins.head(3).tolist()
+    std = float(np.std(mins.head(min(10, len(mins))).tolist())) if len(mins) >= 2 else 4.0
+    risk = "SECURE"
+    confidence = 78
+    if exp_min < 18:
+        risk = "LOW_MINUTES"; confidence -= 22
+    elif exp_min < 24:
+        risk = "MODERATE"; confidence -= 10
+    if std >= 8:
+        risk = "VOLATILE_MINUTES"; confidence -= 14
+    elif std >= 5.5:
+        confidence -= 7
+    stxt = str(status or "").lower()
+    if any(x in stxt for x in ["out", "injured", "inactive"]):
+        risk = "INJURY_RISK"; confidence -= 35; exp_min *= 0.25
+    elif any(x in stxt for x in ["day", "question", "probable", "doubt"]):
+        risk = "INJURY_TAG"; confidence -= 15; exp_min *= 0.92
+    confidence = int(clamp(confidence, 10, 96))
+    return {
+        "expected_minutes": float(clamp(exp_min, 4, 40)),
+        "confidence": confidence,
+        "risk": risk,
+        "std": round(std, 2),
+        "note": f"Weighted L3/L5/L10 minutes; last3={','.join(fmt(x,1) for x in last3)}",
+    }
+
+
+def usage_engine(logs: pd.DataFrame) -> Dict[str, Any]:
+    if logs.empty:
+        return {"fga": 6.0, "fta": 2.0, "usage_score": 45, "note": "Fallback usage"}
+    fga = weighted_recent(logs.get("FGA", pd.Series(dtype=float)), None)
+    fta = weighted_recent(logs.get("FTA", pd.Series(dtype=float)), None)
+    tov = weighted_recent(logs.get("TOV", pd.Series(dtype=float)), 1.2)
+    pts = weighted_recent(logs.get("PTS", pd.Series(dtype=float)), None)
+    fga = fga if fga is not None else max((pts or 8.0) / 1.25, 4.0)
+    fta = fta if fta is not None else 2.0
+    usage_score = 45 + min(fga, 18) * 2.0 + min(fta, 7) * 1.1
+    return {"fga": float(fga), "fta": float(fta), "tov": float(tov or 1.2), "usage_score": int(clamp(usage_score, 30, 95)), "note": "Weighted FGA/FTA/TOV"}
+
+
+def build_team_recent_stats(games: pd.DataFrame, lookback_days: int = 21) -> Dict[str, Dict[str, float]]:
+    # Uses completed scoreboard games available from selected dates plus recent scoreboard window fallback.
+    today = california_now().date()
+    date_list = [(today - timedelta(days=i)).strftime("%Y-%m-%d") for i in range(0, lookback_days + 1)]
+    all_games = []
+    for ds in date_list:
+        df = extract_games([ds])
+        if not df.empty:
+            all_games.append(df)
+    df = pd.concat(all_games, ignore_index=True) if all_games else pd.DataFrame()
+    stats: Dict[str, Dict[str, List[float]]] = {}
+    if df.empty:
+        return {}
+    for _, g in df[df.get("completed", False).eq(True) if "completed" in df else []].iterrows():
+        h, a = g["home_abbr"], g["away_abbr"]
+        hs, as_ = safe_float(g.get("home_score")), safe_float(g.get("away_score"))
+        if hs is None or as_ is None:
+            continue
+        for t, pf, pa in [(h, hs, as_), (a, as_, hs)]:
+            stats.setdefault(t, {"pf": [], "pa": [], "pace_proxy": []})
+            stats[t]["pf"].append(pf)
+            stats[t]["pa"].append(pa)
+            stats[t]["pace_proxy"].append(pf + pa)
+    out = {}
+    for t, vals in stats.items():
+        out[t] = {
+            "pf": float(np.mean(vals["pf"])) if vals["pf"] else 80.0,
+            "pa": float(np.mean(vals["pa"])) if vals["pa"] else 80.0,
+            "pace_proxy": float(np.mean(vals["pace_proxy"])) if vals["pace_proxy"] else 160.0,
+            "games": len(vals["pf"]),
+        }
+    return out
+
+
+def pace_factor(team_abbr: str, opp_abbr: str, team_stats: Dict[str, Dict[str, float]]) -> Tuple[float, str]:
+    t = team_stats.get(clean_team_abbr(team_abbr), {})
+    o = team_stats.get(clean_team_abbr(opp_abbr), {})
+    tp = safe_float(t.get("pace_proxy"), 160.0) or 160.0
+    op = safe_float(o.get("pace_proxy"), 160.0) or 160.0
+    gp = (tp + op) / 2.0
+    fac = clamp(gp / 160.0, 0.92, 1.08)
+    return fac, f"Pace proxy {gp:.1f} vs 160 baseline"
+
+
+def matchup_factor(opp_abbr: str, market: str, pos_bucket: str, team_stats: Dict[str, Dict[str, float]], dvp: Optional[Dict[str, Dict[str, Dict[str, float]]]] = None) -> Tuple[float, str]:
+    """Defense-vs-position matchup factor.
+
+    Primary: recent ESPN boxscore-derived allowed production by Guard/Wing/Post.
+    Fallback: opponent points-allowed proxy when DvP sample is too small.
+    """
+    opp_key = clean_team_abbr(opp_abbr)
+    # Baseline per player appearance by position. Conservative to avoid overfitting public boxscores.
+    baselines = {
+        "Points": {"Guard": 10.8, "Wing": 9.6, "Post": 9.2},
+        "Rebounds": {"Guard": 3.0, "Wing": 4.1, "Post": 5.7},
+        "Assists": {"Guard": 3.0, "Wing": 1.9, "Post": 1.5},
+    }
+    if dvp and opp_key in dvp and pos_bucket in dvp[opp_key]:
+        allowed = safe_float(dvp[opp_key][pos_bucket].get(market))
+        n = safe_float(dvp[opp_key][pos_bucket].get(f"{market}_n"), 0.0) or 0.0
+        base = baselines.get(market, {}).get(pos_bucket, 5.0)
+        if allowed is not None and n >= 10 and base > 0:
+            raw = allowed / base
+            strength = clamp(n / 45.0, 0.35, 1.0)
+            fac = 1 + ((raw - 1) * 0.55 * strength)
+            return clamp(fac, 0.88, 1.13), f"DvP {opp_key} vs {pos_bucket}: {allowed:.2f} {market}/app (n={int(n)})"
+
+    opp = team_stats.get(opp_key, {})
+    pa = safe_float(opp.get("pa"), 80.0) or 80.0
+    raw = pa / 80.0
+    market_mult = {"Points": 0.80, "Rebounds": 0.40, "Assists": 0.50}.get(market, 0.60)
+    role_hint = {"Guard": 1.035 if market == "Assists" else 1.00, "Wing": 1.00, "Post": 1.045 if market == "Rebounds" else 1.00}.get(pos_bucket, 1.00)
+    fac = (1 + ((raw - 1) * market_mult)) * role_hint
+    return clamp(fac, 0.91, 1.10), f"Fallback PA proxy {pa:.1f}; {pos_bucket} role"
+
+
+def projection_for_market(logs: pd.DataFrame, market: str, exp_minutes: float, pace_fac: float, match_fac: float, learn_scale: float) -> Dict[str, Any]:
+    stat = STAT_KEYS[market]
+    if logs.empty or stat not in logs:
+        per_min = {"Points": 0.36, "Rebounds": 0.16, "Assists": 0.10}[market]
+        base = exp_minutes * per_min
+        source = "Fallback per-minute"
+    else:
+        vals = pd.to_numeric(logs[stat], errors="coerce")
+        mins = pd.to_numeric(logs["MIN"], errors="coerce").replace(0, np.nan)
+        per_min_series = (vals / mins).replace([np.inf, -np.inf], np.nan).dropna()
+        recent_pm = weighted_recent(per_min_series, None)
+        stat_recent = weighted_recent(vals, None)
+        if recent_pm is None and stat_recent is None:
+            per_min = {"Points": 0.36, "Rebounds": 0.16, "Assists": 0.10}[market]
+            base = exp_minutes * per_min
+            source = "Fallback per-minute"
+        else:
+            by_rate = exp_minutes * (recent_pm or ((stat_recent or 0) / max(exp_minutes, 1)))
+            by_stat = stat_recent if stat_recent is not None else by_rate
+            base = 0.70 * by_rate + 0.30 * by_stat
+            source = "Weighted per-minute + recent stat"
+    proj = float(max(0, base * pace_fac * match_fac * learn_scale))
+    return {"projection": proj, "source": source}
+
+
+def volatility_for_market(logs: pd.DataFrame, market: str, exp_minutes: float, min_risk: str) -> float:
+    stat = STAT_KEYS[market]
+    base = {"Points": 4.2, "Rebounds": 2.4, "Assists": 1.8}[market]
+    if not logs.empty and stat in logs:
+        vals = pd.to_numeric(logs[stat], errors="coerce").dropna().head(10).tolist()
+        if len(vals) >= 3:
+            base = max(base * 0.65, float(np.std(vals)))
+    if "VOLATILE" in min_risk or "INJURY" in min_risk:
+        base *= 1.20
+    if exp_minutes < 22:
+        base *= 1.12
+    return float(clamp(base, 0.8, {"Points": 9.0, "Rebounds": 5.5, "Assists": 4.8}[market]))
+
+
+def run_prop_simulation(mean: float, sd: float, market: str, sims: int = SIMS) -> np.ndarray:
+    # Negative binomial-ish via gamma-poisson blend for count-like stat with realistic tails.
+    mean = max(0.05, float(mean))
+    sd = max(0.3, float(sd))
+    normal_part = np.random.normal(mean, sd, sims)
+    poisson_part = np.random.poisson(max(mean, 0.05), sims)
+    weight = {"Points": 0.72, "Rebounds": 0.55, "Assists": 0.50}[market]
+    sim = (weight * normal_part) + ((1 - weight) * poisson_part)
+    return np.clip(sim, 0, None)
+
+
+def sim_probability(sims: np.ndarray, line: Optional[float], side: str) -> Optional[float]:
     if line is None:
-        return 0.0
+        return None
+    if side.upper() == "OVER":
+        return float(np.mean(sims > line))
+    return float(np.mean(sims < line))
+
+
+def grade_from_prob(prob: Optional[float], data_score: int, edge: float) -> str:
+    if prob is None:
+        return "NO LINE"
+    if data_score < MIN_DATA_SCORE:
+        return "PASS"
+    if prob >= 0.70 and edge >= 1.5:
+        return "S"
+    if prob >= 0.66:
+        return "A"
+    if prob >= 0.62:
+        return "B"
+    if prob >= 0.58:
+        return "C"
+    return "PASS"
+
+
+def build_decision(proj: float, line: Optional[float], market: str, prob: Optional[float], data_score: int, source: str, minutes_conf: int = 0, minutes_risk: str = "") -> Tuple[str, str, str]:
+    if line is None:
+        return "NO UD LINE" if source == "NO REAL LINE" else "NO LINE", "NO LINE", "No verified real vendor line found"
+    side = "OVER" if proj > line else "UNDER"
+    edge = abs(proj - line)
+    min_edge = MIN_BETTABLE_EDGE.get(market, 1.0)
+    real_source = str(source or "").upper() not in ["NO REAL LINE", "MANUAL", ""]
+    risk_txt = str(minutes_risk or "").upper()
+
+    if not real_source:
+        return f"PASS {side}", "PASS", "Not a verified real vendor line"
+    if data_score < 88:
+        return f"PASS {side}", "PASS", "Data score below 88 official gate"
+    if minutes_conf < 72:
+        return f"PASS {side}", "PASS", "Minutes confidence below safe gate"
+    if any(x in risk_txt for x in ["OUT", "INJURY", "VOLATILE", "LOW_MINUTES", "MINUTES_LIMIT"]):
+        return f"PASS {side}", "PASS", f"Minutes risk gate: {minutes_risk}"
+    if side == "OVER" and minutes_conf < 78:
+        return f"PASS {side}", "PASS", "Over reduced/pass due to non-elite minutes confidence"
+    if prob is None or prob < MIN_BETTABLE_PROB:
+        return f"PASS {side}", "PASS", "Probability below 63.5% official threshold"
+    if edge < min_edge:
+        return f"PASS {side}", "PASS", f"Edge {edge:.2f} below {min_edge:.2f} threshold"
+    return f"✅ {side}", side, f"Official edge/prob/data/minutes gates passed via {source}"
+
+# ============================================================
+# LEARNING / CALIBRATION / CLV
+# ============================================================
+def learning_key(player_id: str, market: str) -> str:
+    return f"{player_id}_{market}"
+
+
+def load_learning() -> Dict[str, Any]:
+    return load_json(LEARN_FILE, {})
+
+
+def apply_learning(player_id: str, market: str, proj: float) -> Tuple[float, float]:
+    data = load_learning()
+    scale = safe_float(data.get(learning_key(player_id, market), 1.0), 1.0) or 1.0
+    return proj * scale, scale
+
+
+def update_learning(player_id: str, market: str, projected: float, actual: float) -> float:
+    data = load_learning()
+    key = learning_key(player_id, market)
+    current = safe_float(data.get(key), 1.0) or 1.0
+    if projected <= 0:
+        return current
+    # Require a few samples by shrinking update strongly.
+    results = load_json(RESULT_LOG, [])
+    samples = sum(1 for r in results if r.get("player_id") == player_id and r.get("market") == market and r.get("actual") is not None)
+    lr = 0.015 if samples < 5 else 0.035
+    err = clamp((actual - projected) / max(1.0, projected), -0.35, 0.35)
+    new_scale = clamp(current * (1 + lr * err), 0.90, 1.10)
+    data[key] = new_scale
+    save_json(LEARN_FILE, data)
+    return new_scale
+
+
+def update_clv_snapshot(player_name: str, market: str, source: str, line: Optional[float]) -> Optional[float]:
+    if line is None:
+        return None
     data = load_json(CLV_FILE, {})
-    key = f"{today_str()}::{normalize_name(player)}::{market}::{source}"
-    line = float(line)
+    today = california_now().strftime("%Y-%m-%d")
+    key = f"{today}_{normalize_name(player_name)}_{market}_{source}"
     old = data.get(key)
+    line = float(line)
     if not old:
-        data[key] = {"player": player, "market": market, "source": source, "open_line": line, "latest_line": line, "last_updated": now_iso()}
+        data[key] = {"player": player_name, "market": market, "source": source, "open_line": line, "latest_line": line, "last_updated": now_iso()}
         save_json(CLV_FILE, data)
         return 0.0
-    open_line = safe_float(old.get("open_line"), line)
+    open_line = safe_float(old.get("open_line"))
     old["latest_line"] = line
     old["last_updated"] = now_iso()
     data[key] = old
     save_json(CLV_FILE, data)
-    return round(line - open_line, 2)
+    return None if open_line is None else round(line - open_line, 2)
 
-def track_line_history(player, market, source, line):
-    hist = load_json(LINE_HISTORY_FILE, {})
-    key = f"{normalize_name(player)}::{market}::{source}"
-    rows = hist.get(key, [])
-    rows.append({"t": now_iso(), "line": safe_float(line)})
-    hist[key] = rows[-40:]
-    save_json(LINE_HISTORY_FILE, hist)
-    if len(hist[key]) < 2:
-        return 0.0
-    first = safe_float(hist[key][0].get("line"))
-    last = safe_float(hist[key][-1].get("line"))
-    if first is None or last is None:
-        return 0.0
-    return round(last - first, 2)
 
-# =========================
-# PROJECTIONS
-# =========================
-def value_from_row(row, market):
-    if not row:
-        return None
-    pts = safe_float(row.get("PTS"), 0) or 0
-    reb = safe_float(row.get("REB"), 0) or 0
-    ast = safe_float(row.get("AST"), 0) or 0
-    stl = safe_float(row.get("STL"), 0) or 0
-    blk = safe_float(row.get("BLK"), 0) or 0
-    fg3m = safe_float(row.get("FG3M"), 0) or 0
-    return {
-        "points": pts,
-        "rebounds": reb,
-        "assists": ast,
-        "pts_rebs_asts": pts + reb + ast,
-        "pts_rebs": pts + reb,
-        "pts_asts": pts + ast,
-        "rebs_asts": reb + ast,
-        "threes": fg3m,
-        "steals": stl,
-        "blocks": blk,
-    }.get(market)
+def calibration_profile() -> Dict[str, Any]:
+    rows = load_json(RESULT_LOG, [])
+    finished = [r for r in rows if r.get("actual") is not None and r.get("projection") is not None and r.get("graded_result") in ["WIN", "LOSS"]]
+    if not finished:
+        return {"samples": 0, "hit_rate": None, "mae": None, "bias": None, "quality": 50}
+    errors = [safe_float(r.get("actual"), 0) - safe_float(r.get("projection"), 0) for r in finished]
+    wins = [1 if r.get("graded_result") == "WIN" else 0 for r in finished]
+    mae = float(np.mean([abs(e) for e in errors]))
+    bias = float(np.mean(errors))
+    hit = float(np.mean(wins))
+    quality = int(clamp(48 + min(len(finished), 200) * 0.22 - mae * 3.2 - abs(bias) * 2.0, 0, 100))
+    prof = {"samples": len(finished), "hit_rate": hit, "mae": round(mae, 3), "bias": round(bias, 3), "quality": quality, "updated_at": now_iso()}
+    save_json(CALIBRATION_FILE, prof)
+    return prof
 
-def project_market(prop, season_df, last5_df, last10_df):
-    player, market, line = prop["Player"], prop["Market"], safe_float(prop["Line"])
-    season = lookup_player_stat(player, season_df)
-    l5 = lookup_player_stat(player, last5_df)
-    l10 = lookup_player_stat(player, last10_df)
+# ============================================================
+# BOARD BUILDER
+# ============================================================
+def build_player_pool(games: pd.DataFrame) -> pd.DataFrame:
+    rosters = get_all_rosters()
+    if rosters.empty or games.empty:
+        return pd.DataFrame()
+    slate_team_ids = set(games["home_id"].astype(str).tolist() + games["away_id"].astype(str).tolist())
+    pool = rosters[rosters["team_id"].astype(str).isin(slate_team_ids)].copy()
+    game_rows = []
+    for _, g in games.iterrows():
+        game_rows.append({"team_id": str(g["home_id"]), "team_abbr": g["home_abbr"], "opp_abbr": g["away_abbr"], "matchup": g["matchup"], "home": True, "event_id": g["event_id"], "game_time": g["game_time"]})
+        game_rows.append({"team_id": str(g["away_id"]), "team_abbr": g["away_abbr"], "opp_abbr": g["home_abbr"], "matchup": g["matchup"], "home": False, "event_id": g["event_id"], "game_time": g["game_time"]})
+    gm = pd.DataFrame(game_rows)
+    pool = pool.merge(gm, on="team_id", how="left")
+    return pool.dropna(subset=["event_id"])
 
-    parts = []
-    for row, w, label in [(l5, 0.45, "L5"), (l10, 0.30, "L10"), (season, 0.25, "Season")]:
-        val = value_from_row(row, market)
-        if val is not None:
-            parts.append((val, w, label))
 
-    notes = []
-    if parts:
-        total_w = sum(w for _, w, _ in parts)
-        proj = sum(v * w for v, w, _ in parts) / total_w
-        score = 76 + min(18, len(parts) * 6)
-        notes.append("Projection blend: " + ", ".join(label for _, _, label in parts))
-        if season:
-            min_val = safe_float(season.get("MIN"))
-            if min_val is not None:
-                notes.append(f"Season minutes {min_val:.1f}")
-    else:
-        # Not a fake line: real line anchor only when stats endpoint is blocked.
-        proj = line if line is not None else 0.0
-        score = 42
-        notes.append("Stats endpoint unavailable/no match; projection anchored to real line with low confidence")
+def build_prop_board(games: pd.DataFrame, markets: List[str], line_source_pref: str, allow_manual: bool, manual_lines: pd.DataFrame, min_minutes: float, injury_df: Optional[pd.DataFrame] = None) -> pd.DataFrame:
+    pool = build_player_pool(games)
+    lines = fetch_all_prop_lines()
+    team_stats = build_team_recent_stats(games)
+    dvp = build_defense_vs_position()
+    injury_df = sanitize_injury_controls(injury_df if injury_df is not None else pd.DataFrame())
+    rows = []
+    if pool.empty:
+        return pd.DataFrame()
 
-    if line is not None:
-        gap = abs(proj - line)
-        if gap > max(2.5, 0.27 * max(line, 1.0)):
-            proj = (proj * 0.72) + (line * 0.28)
-            score -= 6
-            notes.append("Large projection/line gap; conservative blend toward market")
-
-    proj, scale, samples, learn_note = apply_learning(player, market, proj)
-    notes.append(learn_note)
-
-    std_map = {
-        "points": 5.5, "rebounds": 3.2, "assists": 2.8, "pts_rebs_asts": 7.4,
-        "pts_rebs": 6.6, "pts_asts": 6.4, "rebs_asts": 4.4,
-        "threes": 1.55, "steals": 1.05, "blocks": 0.95,
-    }
-    std = std_map.get(market, 4.5)
-    if score < 60:
-        std *= 1.25
-    return float(max(0, proj)), float(std), int(clamp(score, 0, 100)), "; ".join(notes)
-
-def classify_signal(proj, line, prob, ev, score):
-    edge = abs(proj - line) if line is not None else 0
-    notes = []
-    if score < 55:
-        notes.append("Low stat confidence")
-    if edge < 0.35:
-        notes.append("Projection too close to line")
-    if prob is None or prob < 0.54:
-        notes.append("Weak fair probability")
-
-    if score >= MIN_ELITE_SCORE and prob is not None and prob >= MIN_ELITE_PROB and edge >= MIN_ELITE_EDGE and ev is not None and ev > 0:
-        return "ELITE WATCH", notes or ["All strict gates passed"]
-    if score >= MIN_PASS_SCORE and prob is not None and prob >= MIN_PASS_PROB and edge >= MIN_PASS_EDGE and ev is not None and ev > 0:
-        return "PASS", notes or ["Bettable gates passed"]
-    if score >= 62 and prob is not None and prob >= 0.54 and edge >= 0.35:
-        return "LEAN", notes or ["Some gates passed"]
-    return "NO BET", notes or ["Protection gates did not pass"]
-
-def build_board(prop_rows, season_df, last5_df, last10_df):
-    board = []
-    for r in prop_rows:
-        line = safe_float(r.get("Line"))
-        if line is None:
+    for _, p in pool.iterrows():
+        player_id = str(p.get("player_id") or "")
+        player = p.get("player")
+        if not player_id or not player:
             continue
-        proj, std, score, proj_notes = project_market(r, season_df, last5_df, last10_df)
-        side = "OVER" if proj > line else "UNDER"
-        prob = normal_side_probability(proj, line, std, side)
-        price = safe_float(r.get("Price"), -110) or -110
-        ev = expected_value(prob, price)
-        kelly = min(kelly_fraction(prob, price), MAX_RECOMMENDED_KELLY)
-        signal, risk_notes = classify_signal(proj, line, prob, ev, score)
-        board.append({
-            "Player": r["Player"],
-            "Market": r["Market"],
-            "Market Label": r.get("Market Label", MARKET_LABELS.get(r["Market"], r["Market"])),
-            "Game Day": r.get("Game Day", "Unknown"),
-            "Prop Date": r.get("Prop Date"),
-            "Line": line,
-            "Projection": round(proj, 2),
-            "Edge": round(proj - line, 2),
-            "Abs Edge": round(abs(proj - line), 2),
-            "Pick": side,
-            "Fair Prob": round(prob * 100, 1) if prob is not None else None,
-            "EV": round(ev * 100, 1) if ev is not None else None,
-            "Kelly": round(kelly * 100, 2),
-            "Data Score": score,
-            "Signal": signal,
-            "Source": r.get("Source"),
-            "Price": price,
-            "CLV Δ": update_clv_snapshot(r["Player"], r["Market"], r.get("Source"), line),
-            "Line Δ": track_line_history(r["Player"], r["Market"], r.get("Source"), line),
-            "Risk Notes": "; ".join(risk_notes),
-            "Projection Notes": proj_notes,
-            "Saved At": now_iso(),
-            "App Version": APP_VERSION,
-        })
-    df = pd.DataFrame(board)
-    if not df.empty:
-        ranks = {"ELITE WATCH": 0, "PASS": 1, "LEAN": 2, "NO BET": 3}
-        df["_rank"] = df["Signal"].map(ranks).fillna(9)
-        df = df.sort_values(["_rank", "Data Score", "Abs Edge"], ascending=[True, False, False]).drop(columns=["_rank"])
+        logs = get_player_gamelog(player_id)
+        min_model = minutes_engine(logs, str(p.get("status") or ""))
+        exp_min = min_model["expected_minutes"]
+        exp_min, manual_injury_risk, injury_penalty, injury_note = apply_player_injury_adjustment(player, p.get("team_abbr"), exp_min, injury_df)
+        if manual_injury_risk != "ACTIVE":
+            min_model["risk"] = manual_injury_risk
+            min_model["confidence"] = int(clamp(min_model.get("confidence", 50) - injury_penalty, 0, 96))
+            min_model["note"] = f"{min_model.get('note','')}; {injury_note}"
+        if exp_min < min_minutes:
+            continue
+        use = usage_engine(logs)
+        ripple = team_injury_ripple(p.get("team_abbr"), injury_df)
+        pos_bucket = position_bucket(p.get("position"))
+        pace_fac, pace_note = pace_factor(p.get("team_abbr"), p.get("opp_abbr"), team_stats)
+        for market in markets:
+            match_fac, match_note = matchup_factor(p.get("opp_abbr"), market, pos_bucket, team_stats, dvp)
+            base_proj = projection_for_market(logs, market, exp_min, pace_fac, match_fac, 1.0)
+            if ripple.get("usage_boost", 1.0) > 1.0 and manual_injury_risk != "OUT_MANUAL":
+                base_proj["projection"] *= ripple.get("usage_boost", 1.0)
+                base_proj["source"] += f" + injury ripple usage x{ripple.get('usage_boost', 1.0):.3f}"
+            proj, learn_scale = apply_learning(player_id, market, base_proj["projection"])
+            sd = volatility_for_market(logs, market, exp_min, min_model["risk"])
+            sims = run_prop_simulation(proj, sd, market)
+            p10, median, p90 = np.percentile(sims, [10, 50, 90])
+
+            line_row = best_line_for_player(player, market, lines, preferred=line_source_pref)
+            line = None
+            source = "NO REAL LINE"
+            price = DEFAULT_ODDS
+            if line_row:
+                line = safe_float(line_row.get("Line"))
+                source = str(line_row.get("Source"))
+                price = safe_float(line_row.get("Price"), DEFAULT_ODDS) or DEFAULT_ODDS
+            elif allow_manual and not manual_lines.empty:
+                ml = manual_lines[(manual_lines["Player"].apply(lambda x: name_score(player, x) >= 0.90)) & (manual_lines["Market"].eq(market))]
+                if not ml.empty:
+                    line = safe_float(ml.iloc[0]["Line"])
+                    source = "MANUAL"
+                    price = safe_float(ml.iloc[0].get("Price"), DEFAULT_ODDS) or DEFAULT_ODDS
+
+            side = "OVER" if line is not None and proj > line else "UNDER" if line is not None else "NO LINE"
+            prob = sim_probability(sims, line, side) if line is not None else None
+            # Reduce fragile overs before the official filter sees them.
+            if prob is not None and side == "OVER" and ("VOLATILE" in str(min_model["risk"]).upper() or min_model["confidence"] < 78):
+                prob = max(0.0, prob - 0.035)
+            edge = abs(proj - line) if line is not None else None
+            ev = expected_value(prob, price) if prob is not None else None
+            kelly = min(kelly_fraction(prob, price), MAX_RECOMMENDED_KELLY) if prob is not None else 0.0
+            data_score = int(clamp(40 + min_model["confidence"] * 0.42 + use["usage_score"] * 0.25 + (10 if len(logs) >= 5 else 0) + (7 if source not in ["NO REAL LINE", "MANUAL"] else 0), 0, 100))
+            decision, official_side, reason = build_decision(proj, line, market, prob, data_score, source, min_model["confidence"], min_model["risk"])
+            tier = grade_from_prob(prob, data_score, edge or 0)
+            clv = update_clv_snapshot(player, market, source, line) if line is not None and source != "MANUAL" else None
+
+            rows.append({
+                "Player": player,
+                "Player ID": player_id,
+                "Team": p.get("team_abbr"),
+                "Opponent": p.get("opp_abbr"),
+                "Matchup": p.get("matchup"),
+                "Market": market,
+                "Line": line,
+                "Line Source": source,
+                "Price": price,
+                "Projection": round(proj, 2),
+                "Pick": decision,
+                "Official Side": official_side,
+                "Tier": tier,
+                "Prob %": None if prob is None else round(prob * 100, 1),
+                "Edge": None if edge is None else round(edge, 2),
+                "EV": None if ev is None else round(ev, 3),
+                "Kelly": round(kelly, 4),
+                "Floor": round(float(p10), 2),
+                "Median": round(float(median), 2),
+                "Ceiling": round(float(p90), 2),
+                "Expected Min": round(exp_min, 1),
+                "Minutes Risk": min_model["risk"],
+                "Minutes Conf": min_model["confidence"],
+                "Usage Score": use["usage_score"],
+                "Pace Factor": round(pace_fac, 3),
+                "Matchup Factor": round(match_fac, 3),
+                "Position": p.get("position"),
+                "Role": pos_bucket,
+                "Data Score": data_score,
+                "Learn Scale": round(learn_scale, 3),
+                "CLV Δ": clv,
+                "Reason": reason,
+                "Pace Note": pace_note,
+                "Matchup Note": match_note,
+                "Injury Note": injury_note,
+                "Team Injury Ripple": f"OUT {int(ripple.get('out_count',0))} | Q {int(ripple.get('q_count',0))} | LIMIT {int(ripple.get('limit_count',0))} | usage x{ripple.get('usage_boost',1.0):.3f}",
+                "Minutes Note": min_model["note"],
+                "Projection Source": base_proj["source"],
+                "Game Time": p.get("game_time"),
+                "Event ID": p.get("event_id"),
+            })
+    df = pd.DataFrame(rows)
+    if df.empty:
+        return df
+    sort_cols = ["Tier", "Prob %", "Edge", "Data Score"]
+    tier_order = {"S": 5, "A": 4, "B": 3, "C": 2, "PASS": 1, "NO LINE": 0}
+    df["_tier_sort"] = df["Tier"].map(tier_order).fillna(0)
+    df = df.sort_values(["_tier_sort", "Prob %", "Edge", "Data Score"], ascending=[False, False, False, False]).drop(columns=["_tier_sort"])
     return df
 
-# =========================
-# SAVE / GRADE
-# =========================
-def save_official_snapshots(rows, tag="before"):
-    existing = load_json(PICK_LOG, [])
-    ba = load_json(BEFORE_AFTER_FILE, [])
-    count = 0
-    for row in rows or []:
-        rec = dict(row)
-        rec["Snapshot Type"] = tag
-        rec["Snapshot Date"] = today_str()
-        rec["Official ID"] = f"{today_str()}::{normalize_name(rec.get('Player'))}::{rec.get('Market')}::{rec.get('Source')}::{rec.get('Line')}::{tag}"
-        if not any(x.get("Official ID") == rec["Official ID"] for x in existing):
-            existing.append(rec)
-            count += 1
-        ba.append(rec)
-    save_json(PICK_LOG, existing[-30000:])
-    save_json(BEFORE_AFTER_FILE, ba[-40000:])
-    return count
+# ============================================================
+# MONEYLINE ENGINE
+# ============================================================
+def odds_api_moneylines() -> pd.DataFrame:
+    if not ODDS_API_KEY:
+        return pd.DataFrame()
+    try:
+        data = safe_get_json(f"{ODDS_API_BASE}/sports/basketball_wnba/odds", params={
+            "apiKey": ODDS_API_KEY,
+            "regions": "us",
+            "markets": "h2h",
+            "oddsFormat": "american",
+        }, timeout=18) or []
+        rows = []
+        for game in data:
+            home = game.get("home_team")
+            away = game.get("away_team")
+            for book in game.get("bookmakers", []) or []:
+                for market in book.get("markets", []) or []:
+                    if market.get("key") != "h2h":
+                        continue
+                    for out in market.get("outcomes", []) or []:
+                        rows.append({
+                            "Game": f"{away} @ {home}",
+                            "Team": out.get("name"),
+                            "Price": safe_float(out.get("price")),
+                            "Book": book.get("title"),
+                        })
+        return pd.DataFrame(rows)
+    except Exception as e:
+        log_source_request("OddsAPI", "ERROR", str(e))
+        return pd.DataFrame()
 
-def grade_pick(row, actual):
-    actual, line, pick = safe_float(actual), safe_float(row.get("Line")), row.get("Pick")
-    if actual is None or line is None or pick not in ["OVER", "UNDER"]:
-        return None
-    if pick == "OVER":
-        return "WIN" if actual > line else "LOSS" if actual < line else "PUSH"
-    return "WIN" if actual < line else "LOSS" if actual > line else "PUSH"
 
-def save_grade(player, market, line, actual, source_filter=None):
-    picks = load_json(PICK_LOG, [])
-    results = load_json(RESULT_LOG, [])
-    matches = []
-    for r in reversed(picks):
-        if normalize_name(r.get("Player")) == normalize_name(player) and r.get("Market") == market and safe_float(r.get("Line")) == safe_float(line):
-            if source_filter and r.get("Source") != source_filter:
-                continue
-            matches.append(r)
-    count = 0
-    for r in matches[:6]:
-        result = grade_pick(r, actual)
-        if result is None:
-            continue
-        out = dict(r)
-        out.update({"Actual": safe_float(actual), "Graded Result": result, "Graded At": now_iso()})
-        results.append(out)
-        update_learning(out.get("Player"), out.get("Market"), out.get("Projection"), actual)
-        count += 1
-    save_json(RESULT_LOG, results[-30000:])
-    return count
+def team_rating(abbr: str, team_stats: Dict[str, Dict[str, float]]) -> Dict[str, float]:
+    s = team_stats.get(clean_team_abbr(abbr), {})
+    pf = safe_float(s.get("pf"), 80.0) or 80.0
+    pa = safe_float(s.get("pa"), 80.0) or 80.0
+    pace = safe_float(s.get("pace_proxy"), 160.0) or 160.0
+    games = safe_float(s.get("games"), 0.0) or 0.0
+    net = pf - pa
+    # Shrink if low sample.
+    shrink = games / (games + 5.0)
+    return {"pf": pf, "pa": pa, "net": net * shrink, "pace": pace, "games": games}
 
-# =========================
-# UI RENDER
-# =========================
-def render_games(games, label):
-    if not games:
-        st.info(f"No {label.lower()} games loaded. The app still works from real prop lines.")
-        return
-    for g in games:
-        st.markdown(f"""
-        <div class="game-card">
-            <b>{g.get('Away')} @ {g.get('Home')}</b><br>
-            <span class="small-muted">{g.get('Date')} • {g.get('Status')} • {g.get('Time')}</span>
-        </div>
-        """, unsafe_allow_html=True)
 
-def render_player_cards(df, max_cards=200):
+def build_moneyline_board(games: pd.DataFrame, injury_df: Optional[pd.DataFrame] = None) -> pd.DataFrame:
+    if games.empty:
+        return pd.DataFrame()
+    team_stats = build_team_recent_stats(games)
+    injury_df = sanitize_injury_controls(injury_df if injury_df is not None else pd.DataFrame())
+    odds = odds_api_moneylines()
+    rows = []
+    for _, g in games.iterrows():
+        h = clean_team_abbr(g["home_abbr"]); a = clean_team_abbr(g["away_abbr"])
+        hr = team_rating(h, team_stats); ar = team_rating(a, team_stats)
+        h_inj = team_injury_ripple(h, injury_df); a_inj = team_injury_ripple(a, injury_df)
+        home_adv = 2.1 if not g.get("neutral") else 0.0
+        expected_margin = (hr["net"] - ar["net"]) + home_adv + h_inj.get("ml_adj", 0.0) - a_inj.get("ml_adj", 0.0)
+        total_base = ((hr["pf"] + ar["pf"] + hr["pa"] + ar["pa"]) / 2.0)
+        pace = ((hr["pace"] + ar["pace"]) / 2.0) / 160.0
+        total_base *= clamp(pace, 0.94, 1.06)
+        margins = np.random.normal(expected_margin, 10.5, ML_SIMS)
+        home_win = float(np.mean(margins > 0))
+        away_win = 1 - home_win
+        home_score = total_base / 2 + expected_margin / 2
+        away_score = total_base / 2 - expected_margin / 2
+
+        for team_name, abbr, win_prob, model_margin in [
+            (g["home_team"], h, home_win, expected_margin),
+            (g["away_team"], a, away_win, -expected_margin),
+        ]:
+            price = None; book = None; book_prob = None; edge = None
+            if not odds.empty:
+                tmp = odds.copy()
+                tmp["score"] = tmp["Team"].apply(lambda x: max(name_score(team_name, x), name_score(abbr, x)))
+                tmp = tmp[tmp["score"] >= 0.65].sort_values("score", ascending=False)
+                if not tmp.empty:
+                    price = safe_float(tmp.iloc[0]["Price"]); book = tmp.iloc[0]["Book"]
+                    book_prob = american_to_implied(price)
+                    edge = win_prob - book_prob if book_prob is not None else None
+            tier = "NO ODDS"
+            decision = "NO ODDS"
+            if edge is not None:
+                if edge >= 0.08 and win_prob >= 0.58:
+                    tier = "A"; decision = "✅ ML"
+                elif edge >= 0.05 and win_prob >= 0.55:
+                    tier = "B"; decision = "LEAN ML"
+                elif edge >= 0.025:
+                    tier = "C"; decision = "PASS ML LEAN"
+                else:
+                    tier = "PASS"; decision = "PASS"
+            rows.append({
+                "Game": g["matchup"],
+                "Team": abbr,
+                "Team Name": team_name,
+                "Model Win %": round(win_prob * 100, 1),
+                "Book Win %": None if book_prob is None else round(book_prob * 100, 1),
+                "ML Price": price,
+                "Book": book,
+                "Edge %": None if edge is None else round(edge * 100, 1),
+                "Decision": decision,
+                "Tier": tier,
+                "Model Margin": round(model_margin, 1),
+                "Projected Score": round(home_score, 1) if abbr == h else round(away_score, 1),
+                "Recent Net": round(hr["net"], 1) if abbr == h else round(ar["net"], 1),
+                "Injury ML Adj": round(h_inj.get("ml_adj", 0.0), 2) if abbr == h else round(a_inj.get("ml_adj", 0.0), 2),
+                "Games In Sample": int(hr["games"] if abbr == h else ar["games"]),
+            })
+    df = pd.DataFrame(rows)
     if df.empty:
-        st.info("No props match your filters.")
-        return
-    for _, row in df.head(max_cards).iterrows():
-        sig = row["Signal"]
-        card = "green-card" if sig in ["ELITE WATCH", "PASS"] else "warn-card" if sig == "LEAN" else "clean-card"
-        badge = "good-badge" if sig in ["ELITE WATCH", "PASS"] else "yellow-badge" if sig == "LEAN" else "red-badge"
-        st.markdown(f"""
-        <div class="{card}">
-            <div style="display:flex;justify-content:space-between;gap:12px;align-items:flex-start;">
-                <div>
-                    <div style="font-size:23px;font-weight:950;">{row['Player']}</div>
-                    <div class="small-muted">{row.get('Game Day', 'Unknown')} • {row['Market Label']} • {row['Source']} • Price {row['Price']}</div>
-                </div>
-                <div><span class="badge {badge}">{sig}</span></div>
-            </div>
-            <div class="kpi-strip">
-                <div class="kpi-box"><div class="kpi-label">Projection</div><div class="kpi-value">{row['Projection']}</div></div>
-                <div class="kpi-box"><div class="kpi-label">Line</div><div class="kpi-value">{row['Line']}</div></div>
-                <div class="kpi-box"><div class="kpi-label">Edge</div><div class="kpi-value">{row['Edge']:+.2f}</div></div>
-                <div class="kpi-box"><div class="kpi-label">Pick</div><div class="kpi-value">{row['Pick']}</div></div>
-                <div class="kpi-box"><div class="kpi-label">Fair Prob</div><div class="kpi-value">{row['Fair Prob']}%</div><div class="kpi-sub">EV {row['EV']}%</div></div>
-                <div class="kpi-box"><div class="kpi-label">Data Score</div><div class="kpi-value">{row['Data Score']}/100</div></div>
-            </div>
-            <div class="small-muted"><b>CLV Δ:</b> {row['CLV Δ']} • <b>Line Δ:</b> {row['Line Δ']} • <b>Kelly:</b> {row['Kelly']}%</div>
-            <div class="small-muted"><b>Risk:</b> {row['Risk Notes']}</div>
-            <div class="small-muted"><b>Model:</b> {row['Projection Notes']}</div>
-        </div>
-        """, unsafe_allow_html=True)
+        return df
+    tier_order = {"A": 4, "B": 3, "C": 2, "PASS": 1, "NO ODDS": 0}
+    df["_tier"] = df["Tier"].map(tier_order).fillna(0)
+    return df.sort_values(["_tier", "Edge %", "Model Win %"], ascending=[False, False, False]).drop(columns=["_tier"])
 
-# =========================
-# APP BODY
-# =========================
-st.markdown(f"""
-<div class="hero-panel">
-  <div class="big-title">🏀 WNBA Prop Engine</div>
-  <div class="sub-title">Streamlit safe-load fix • Real lines only • Full player-card board • Before/After snapshots • Grading + learning</div>
-  <span class="badge good-badge">{APP_VERSION}</span>
-  <span class="badge blue-badge">Underdog first</span>
-  <span class="badge">No fake lines</span>
-  <span class="badge red-badge">WNBA-only sport filter</span>
-</div>
-""", unsafe_allow_html=True)
+# ============================================================
+# SAVE / GRADE WORKFLOW
+# ============================================================
+def save_official_picks(board: pd.DataFrame, ml_board: pd.DataFrame) -> int:
+    rows = load_json(PICK_LOG, [])
+    today = california_now().strftime("%Y-%m-%d")
+    count = 0
+    if not board.empty:
+        official = board[board["Pick"].astype(str).str.startswith("✅")].copy()
+        for _, r in official.iterrows():
+            item = r.to_dict()
+            item.update({"saved_at": now_iso(), "date": today, "type": "PROP", "pick_id": f"{today}_{r['Player ID']}_{r['Market']}_{r['Line Source']}"})
+            if item["pick_id"] not in [x.get("pick_id") for x in rows]:
+                rows.append(item); count += 1
+    if not ml_board.empty:
+        official_ml = ml_board[ml_board["Decision"].astype(str).str.startswith("✅")].copy()
+        for _, r in official_ml.iterrows():
+            item = r.to_dict()
+            item.update({"saved_at": now_iso(), "date": today, "type": "MONEYLINE", "pick_id": f"{today}_ML_{r['Team']}_{r['Game']}"})
+            if item["pick_id"] not in [x.get("pick_id") for x in rows]:
+                rows.append(item); count += 1
+    save_json(PICK_LOG, rows[-5000:])
+    return count
 
-with st.sidebar:
-    st.header("Controls")
-    source_choice = st.selectbox("Line source", ["Underdog first", "Underdog only", "PrizePicks backup only", "All available"], index=0)
-    season = st.text_input("WNBA season", value=os.getenv("WNBA_SEASON", "2025"))
-    load_stats = st.checkbox("Use WNBA stats endpoint for projections", value=False)
-    selected_day = st.radio("Board filter", ["All Lines", "Today", "Tomorrow"], horizontal=True)
-    st.divider()
-    st.caption("Filters")
-    selected_markets = st.multiselect("Markets", list(MARKET_LABELS.values()), default=list(MARKET_LABELS.values()))
-    signal_filter = st.multiselect("Signals", ["ELITE WATCH", "PASS", "LEAN", "NO BET"], default=["ELITE WATCH", "PASS", "LEAN", "NO BET"])
-    search_name = st.text_input("Optional player filter", value="")
-    max_cards = st.slider("Max cards", 25, 300, 150)
-    st.divider()
-    save_tag = st.selectbox("Snapshot type", ["before", "after"], index=0)
-    only_save = st.multiselect("Save only signals", ["ELITE WATCH", "PASS", "LEAN", "NO BET"], default=["ELITE WATCH", "PASS", "LEAN"])
-    st.divider()
-    refresh = st.button("🔄 Refresh / Load Board", use_container_width=True)
 
-# Auto-load so the page is not blank.
-if "loaded_once" not in st.session_state:
-    st.session_state.loaded_once = True
-    auto_load = True
-else:
-    auto_load = False
+def grade_saved_props() -> int:
+    saved = load_json(PICK_LOG, [])
+    results = load_json(RESULT_LOG, [])
+    existing = set(r.get("pick_id") for r in results)
+    graded = 0
+    for p in saved:
+        if p.get("type") != "PROP" or p.get("pick_id") in existing:
+            continue
+        event_id = str(p.get("Event ID") or "")
+        if not event_id:
+            continue
+        box = boxscore_player_rows(event_id)
+        if box.empty:
+            continue
+        match = box.copy()
+        match["score"] = match["player"].apply(lambda x: name_score(p.get("Player"), x))
+        match = match[match["score"] >= 0.88].sort_values("score", ascending=False)
+        if match.empty:
+            continue
+        row = match.iloc[0]
+        actual = safe_float(row.get(STAT_KEYS.get(p.get("Market"), "PTS")))
+        line = safe_float(p.get("Line"))
+        side = str(p.get("Official Side") or "")
+        if actual is None or line is None or side not in ["OVER", "UNDER"]:
+            continue
+        win = actual > line if side == "OVER" else actual < line
+        res = dict(p)
+        res.update({"actual": actual, "graded_at": now_iso(), "graded_result": "WIN" if win else "LOSS", "win": bool(win)})
+        results.append(res)
+        update_learning(str(p.get("Player ID")), str(p.get("Market")), safe_float(p.get("Projection"), 0) or 0, actual)
+        graded += 1
+    save_json(RESULT_LOG, results[-5000:])
+    return graded
 
-if refresh:
-    st.cache_data.clear()
-
-should_load = refresh or auto_load
-
-if should_load:
-    with st.spinner("Loading real WNBA prop board..."):
-        prop_rows = fetch_all_real_wnba_props(source_choice)
-        if load_stats:
-            try:
-                season_df = get_wnba_player_dashboard(season=season, last_n="0")
-            except Exception as e:
-                log_source_request("wnba_player_dashboard_season", "ERROR", str(e))
-                season_df = pd.DataFrame()
-            try:
-                last5_df = get_wnba_player_dashboard(season=season, last_n="5")
-            except Exception as e:
-                log_source_request("wnba_player_dashboard_l5", "ERROR", str(e))
-                last5_df = pd.DataFrame()
-            try:
-                last10_df = get_wnba_player_dashboard(season=season, last_n="10")
-            except Exception as e:
-                log_source_request("wnba_player_dashboard_l10", "ERROR", str(e))
-                last10_df = pd.DataFrame()
-        else:
-            season_df = pd.DataFrame()
-            last5_df = pd.DataFrame()
-            last10_df = pd.DataFrame()
-        try:
-            games_today = get_wnba_scoreboard(today_str())
-        except Exception as e:
-            log_source_request("wnba_scoreboard_today", "ERROR", str(e))
-            games_today = []
-        try:
-            games_tomorrow = get_wnba_scoreboard(tomorrow_str())
-        except Exception as e:
-            log_source_request("wnba_scoreboard_tomorrow", "ERROR", str(e))
-            games_tomorrow = []
-        board_df = build_board(prop_rows, season_df, last5_df, last10_df)
-        st.session_state["board_df"] = board_df
-        st.session_state["games_today"] = games_today
-        st.session_state["games_tomorrow"] = games_tomorrow
-        st.session_state["stats_loaded"] = not season_df.empty
-
-board_df = st.session_state.get("board_df", pd.DataFrame())
-games_today = st.session_state.get("games_today", [])
-games_tomorrow = st.session_state.get("games_tomorrow", [])
-stats_loaded = st.session_state.get("stats_loaded", False)
-
-if board_df.empty:
-    st.markdown("""
-    <div class="red-card">
-    <b>No WNBA prop lines loaded yet.</b><br>
-    Click Refresh / Load Board. If it still shows this, Underdog/PrizePicks did not return WNBA props or blocked the request.
-    The app will not create fake lines. Keep Board filter = All Lines. If logs show market/name positive but line=0, use v2.6+ because Underdog moved lines into text/related fields.
+# ============================================================
+# DISPLAY HELPERS
+# ============================================================
+def render_header() -> None:
+    st.markdown(f"""
+    <div class='hero-panel'>
+      <div class='big-title'>WNBA Elite Prop + Moneyline Engine</div>
+      <div class='sub-title'>Points • Rebounds • Assists • Moneyline | Real WNBA stats + real lines when available | {APP_VERSION}</div>
+      <div style='margin-top:10px'>
+        <span class='badge good-badge'>Minutes Engine</span>
+        <span class='badge'>Usage Engine</span>
+        <span class='badge'>Pace Engine</span>
+        <span class='badge'>Monte Carlo {SIMS:,}</span>
+        <span class='badge'>CLV + Learning</span>
+      </div>
     </div>
     """, unsafe_allow_html=True)
-else:
-    filt = board_df.copy()
 
-    # Day filter fix:
-    # Keep All Lines as the default because some real prop sources do not expose a usable game date.
-    # Today/Tomorrow only filters rows that have a matching Game Day; Unknown rows are still shown
-    # so posted Underdog lines do not disappear just because the schedule endpoint timed out.
-    if selected_day in ["Today", "Tomorrow"] and "Game Day" in filt.columns:
-        known_match = filt[filt["Game Day"].astype(str) == selected_day]
-        unknown_rows = filt[filt["Game Day"].astype(str).isin(["Unknown", "", "None", "nan"])]
-        filt = pd.concat([known_match, unknown_rows], ignore_index=True)
 
-    if selected_markets:
-        filt = filt[filt["Market Label"].isin(selected_markets)]
-    if signal_filter:
-        filt = filt[filt["Signal"].isin(signal_filter)]
-    if search_name.strip():
-        filt = filt[filt["Player"].str.lower().str.contains(search_name.lower(), na=False)]
+def render_kpis(board: pd.DataFrame, ml_board: pd.DataFrame, games: pd.DataFrame) -> None:
+    props = 0 if board.empty else len(board)
+    official = 0 if board.empty else int(board["Pick"].astype(str).str.startswith("✅").sum())
+    no_line = 0 if board.empty else int(board["Line Source"].eq("NO REAL LINE").sum())
+    ml_edges = 0 if ml_board.empty else int(ml_board["Decision"].astype(str).str.startswith("✅").sum())
+    prof = calibration_profile()
+    st.markdown(f"""
+    <div class='kpi-strip'>
+      <div class='kpi-box'><div class='kpi-label'>Games</div><div class='kpi-value'>{len(games)}</div><div class='kpi-sub'>Current slate</div></div>
+      <div class='kpi-box'><div class='kpi-label'>Prop Rows</div><div class='kpi-value'>{props}</div><div class='kpi-sub'>P/R/A board</div></div>
+      <div class='kpi-box'><div class='kpi-label'>Official Props</div><div class='kpi-value green'>{official}</div><div class='kpi-sub'>Passed hard gates</div></div>
+      <div class='kpi-box'><div class='kpi-label'>No Real Line</div><div class='kpi-value orange'>{no_line}</div><div class='kpi-sub'>Projection only</div></div>
+      <div class='kpi-box'><div class='kpi-label'>ML Edges</div><div class='kpi-value green'>{ml_edges}</div><div class='kpi-sub'>Odds API required</div></div>
+      <div class='kpi-box'><div class='kpi-label'>Learning</div><div class='kpi-value'>{prof.get('samples',0)}</div><div class='kpi-sub'>Graded samples</div></div>
+    </div>
+    """, unsafe_allow_html=True)
 
-    c1, c2, c3, c4, c5, c6 = st.columns(6)
-    c1.metric("Props shown", len(filt))
-    c2.metric("Board filter", selected_day)
-    c3.metric("Elite", int((filt["Signal"] == "ELITE WATCH").sum()))
-    c4.metric("Pass", int((filt["Signal"] == "PASS").sum()))
-    c5.metric("Lean", int((filt["Signal"] == "LEAN").sum()))
-    c6.metric("Stats loaded", "YES" if stats_loaded else "LOW")
 
-    save_rows = filt[filt["Signal"].isin(only_save)].to_dict("records") if only_save else filt.to_dict("records")
-    if st.button(f"💾 Save official {save_tag} snapshots", use_container_width=True):
-        n = save_official_snapshots(save_rows, tag=save_tag)
-        st.success(f"Saved {n} official {save_tag} snapshots.")
+def board_view(df: pd.DataFrame) -> pd.DataFrame:
+    cols = ["Player", "Team", "Matchup", "Market", "Line", "Line Source", "Projection", "Pick", "Tier", "Prob %", "Edge", "Expected Min", "Minutes Risk", "Data Score", "Floor", "Median", "Ceiling", "Reason"]
+    return df[[c for c in cols if c in df.columns]].copy() if not df.empty else df
 
-    tab_cards, tab_table, tab_games, tab_saved, tab_grade, tab_learning = st.tabs(["🃏 Player Cards", "📋 Prop Table", "📅 Today/Tomorrow", "💾 Saved/CLV", "✅ Grade", "🧠 Learning"])
 
-    with tab_cards:
-        render_player_cards(filt, max_cards=max_cards)
+def render_player_cards(df: pd.DataFrame, max_cards: int = 20) -> None:
+    if df.empty:
+        st.info("No rows to show.")
+        return
+    for _, r in df.head(max_cards).iterrows():
+        badge_class = "good-badge" if str(r.get("Pick", "")).startswith("✅") else "yellow-badge" if "PASS" in str(r.get("Pick", "")) else "badge"
+        st.markdown(f"""
+        <div class='pick-card'>
+          <div class='player-name'>{html.escape(str(r.get('Player')))} — {html.escape(str(r.get('Market')))}</div>
+          <div class='small-muted'>{html.escape(str(r.get('Team')))} vs {html.escape(str(r.get('Opponent')))} | {html.escape(str(r.get('Matchup')))}</div>
+          <div style='margin-top:8px'>
+            <span class='badge {badge_class}'>{html.escape(str(r.get('Pick')))}</span>
+            <span class='badge'>Line: {fmt(r.get('Line'),1)} {html.escape(str(r.get('Line Source')))}</span>
+            <span class='badge'>Proj: {fmt(r.get('Projection'),2)}</span>
+            <span class='badge'>Prob: {fmt(r.get('Prob %'),1)}%</span>
+            <span class='badge'>Tier: {html.escape(str(r.get('Tier')))}</span>
+          </div>
+          <div class='hr-soft'></div>
+          <div class='small-muted'>Floor {fmt(r.get('Floor'),1)} | Median {fmt(r.get('Median'),1)} | Ceiling {fmt(r.get('Ceiling'),1)} | Min {fmt(r.get('Expected Min'),1)} | Data {r.get('Data Score')}</div>
+          <div class='small-muted'>Reason: {html.escape(str(r.get('Reason')))}</div>
+          <div class='small-muted'>Pace: {html.escape(str(r.get('Pace Note')))} | Matchup: {html.escape(str(r.get('Matchup Note')))}</div>
+        </div>
+        """, unsafe_allow_html=True)
 
-    with tab_table:
-        cols = ["Player", "Game Day", "Prop Date", "Market Label", "Line", "Projection", "Edge", "Pick", "Fair Prob", "EV", "Kelly", "Data Score", "Signal", "Source", "CLV Δ", "Line Δ", "Risk Notes", "Projection Notes"]
-        safe_cols = [c for c in cols if c in filt.columns]
-        st.dataframe(filt[safe_cols], use_container_width=True, height=740)
-        st.download_button("Download board CSV", filt[safe_cols].to_csv(index=False).encode("utf-8"), "wnba_board.csv", "text/csv")
+# ============================================================
+# MAIN APP
+# ============================================================
+def main() -> None:
+    render_header()
 
-    with tab_games:
-        g1, g2 = st.columns(2)
-        with g1:
-            st.subheader("Today")
-            render_games(games_today, "Today")
-        with g2:
-            st.subheader("Tomorrow")
-            render_games(games_tomorrow, "Tomorrow")
+    with st.sidebar:
+        st.header("Controls")
+        day_mode = st.selectbox("Slate", ["Today", "Tomorrow", "Today + Tomorrow"], index=0)
+        markets = st.multiselect("Markets", MARKETS, default=MARKETS)
+        line_source_pref = st.selectbox("Preferred Line Source", ["Underdog", "PrizePicks"], index=0)
+        min_minutes = st.slider("Minimum Expected Minutes", 0.0, 32.0, 14.0, 1.0)
+        allow_manual = st.checkbox("Allow manual lines if no real line", value=False)
+        st.caption("Manual lines are labeled MANUAL and are not treated as real vendor lines.")
+        uploaded_manual = st.file_uploader("Optional manual lines CSV: Player,Market,Line,Price", type=["csv"])
+        refresh = st.button("Refresh Board", type="primary")
+        st.divider()
+        if st.button("Save Official Plays"):
+            st.session_state["save_requested"] = True
+        if st.button("Grade Completed Saved Props"):
+            st.session_state["grade_requested"] = True
 
-    with tab_saved:
-        saved = pd.DataFrame(load_json(PICK_LOG, []))
-        clv = pd.DataFrame(load_json(CLV_FILE, {}).values())
-        st.subheader("Official saved snapshots")
-        if not saved.empty:
-            st.dataframe(saved.tail(600), use_container_width=True, height=350)
+    manual_lines = pd.DataFrame()
+    if uploaded_manual is not None:
+        try:
+            manual_lines = pd.read_csv(uploaded_manual)
+        except Exception as e:
+            st.sidebar.error(f"Manual CSV error: {e}")
+
+    dates = target_dates(day_mode)
+    games = extract_games(dates)
+
+    if games.empty:
+        st.warning("No WNBA games found for this slate from ESPN. Try Today + Tomorrow or check the schedule date.")
+        st.stop()
+
+    with st.sidebar:
+        st.divider()
+        st.subheader("Manual Injury Ripple")
+        st.caption("Use this to mark OUT / QUESTIONABLE / MINUTES LIMIT. Team ML Adj is optional; negative hurts that team, positive boosts it.")
+        saved_inj = pd.DataFrame(load_json(INJURY_CONTROL_FILE, []))
+        if saved_inj.empty:
+            saved_inj = pd.DataFrame([{"Player": "", "Team": "", "Status": "ACTIVE", "Minutes Limit": None, "Team ML Adj": 0.0, "Notes": ""}])
+        injury_controls = st.data_editor(
+            saved_inj,
+            num_rows="dynamic",
+            use_container_width=True,
+            column_config={
+                "Status": st.column_config.SelectboxColumn("Status", options=["ACTIVE", "OUT", "QUESTIONABLE", "MINUTES LIMIT"]),
+                "Minutes Limit": st.column_config.NumberColumn("Minutes Limit", min_value=0.0, max_value=40.0, step=1.0),
+                "Team ML Adj": st.column_config.NumberColumn("Team ML Adj", step=0.5),
+            },
+            key="injury_controls_editor",
+        )
+        if st.button("Save Injury Controls"):
+            clean_inj = sanitize_injury_controls(injury_controls)
+            save_json(INJURY_CONTROL_FILE, clean_inj.to_dict(orient="records"))
+            st.success("Injury controls saved.")
+    injury_controls = sanitize_injury_controls(injury_controls)
+
+    with st.expander("Slate Games", expanded=True):
+        st.dataframe(games[["date", "matchup", "game_time", "status", "venue"]], use_container_width=True, hide_index=True)
+
+    with st.spinner("Building WNBA prop board with ESPN stats, real prop lines, pace, minutes, and simulations..."):
+        board = build_prop_board(games, markets, line_source_pref, allow_manual, manual_lines, min_minutes, injury_controls)
+        ml_board = build_moneyline_board(games, injury_controls)
+
+    if st.session_state.get("save_requested"):
+        n = save_official_picks(board, ml_board)
+        st.success(f"Saved {n} official plays.")
+        st.session_state["save_requested"] = False
+
+    if st.session_state.get("grade_requested"):
+        n = grade_saved_props()
+        st.success(f"Graded {n} completed prop plays.")
+        st.session_state["grade_requested"] = False
+
+    render_kpis(board, ml_board, games)
+
+    tabs = st.tabs(["Best Bets", "Main Board", "Points", "Rebounds", "Assists", "Moneyline", "Player Cards", "Saved/Graded", "Diagnostics"])
+
+    with tabs[0]:
+        st.markdown("<div class='section-title-pro'>Best Prop Plays</div>", unsafe_allow_html=True)
+        if board.empty:
+            st.info("No prop board rows built.")
         else:
-            st.info("No saved snapshots yet.")
-        st.subheader("CLV tracker")
-        if not clv.empty:
-            st.dataframe(clv.tail(600), use_container_width=True, height=300)
+            best = board[board["Pick"].astype(str).str.startswith("✅")].copy()
+            if best.empty:
+                st.warning("No official prop plays passed the hard gates. Showing top leans instead.")
+                best = board[board["Line"].notna()].head(12)
+            st.dataframe(board_view(best), use_container_width=True, hide_index=True)
+            render_player_cards(best, 8)
+        st.markdown("<div class='section-title-pro'>Best Moneylines</div>", unsafe_allow_html=True)
+        if ml_board.empty:
+            st.info("No moneyline board available.")
         else:
-            st.info("No CLV rows yet.")
+            st.dataframe(ml_board.head(12), use_container_width=True, hide_index=True)
 
-    with tab_grade:
-        with st.form("grade_form"):
-            g_player = st.text_input("Player name")
-            inv_market = {v: k for k, v in MARKET_LABELS.items()}
-            g_market_label = st.selectbox("Market", list(MARKET_LABELS.values()))
-            g_line = st.number_input("Saved line", min_value=0.0, max_value=100.0, step=0.5)
-            g_actual = st.number_input("Actual result", min_value=0.0, max_value=150.0, step=0.5)
-            g_source = st.text_input("Source filter optional", value="")
-            submitted = st.form_submit_button("Grade and update learning")
-            if submitted:
-                n = save_grade(g_player, inv_market[g_market_label], g_line, g_actual, g_source or None)
-                if n:
-                    st.success(f"Graded {n} saved snapshot(s).")
-                else:
-                    st.warning("No matching saved snapshot found.")
-        results = pd.DataFrame(load_json(RESULT_LOG, []))
-        if not results.empty:
-            st.dataframe(results.tail(600), use_container_width=True, height=360)
-        else:
-            st.info("No graded results yet.")
+    with tabs[1]:
+        st.dataframe(board_view(board), use_container_width=True, hide_index=True)
+        if not board.empty:
+            csv = board.to_csv(index=False).encode("utf-8")
+            st.download_button("Download Full Prop Board CSV", csv, "wnba_prop_board.csv", "text/csv")
 
-    with tab_learning:
-        learn = load_json(LEARN_FILE, {})
-        if not learn:
-            st.info("Learning file is empty until you grade results.")
-        else:
-            rows = []
-            for k, v in learn.items():
-                player, market = k.split("::", 1) if "::" in k else (k, "")
-                rows.append({"Player": player, "Market": market, "Scale": v.get("scale"), "Samples": v.get("samples"), "Avg Residual": v.get("avg_residual"), "Updated": v.get("updated_at")})
-            st.dataframe(pd.DataFrame(rows), use_container_width=True, height=520)
+    for i, market in enumerate(["Points", "Rebounds", "Assists"], start=2):
+        with tabs[i]:
+            sub = board[board["Market"].eq(market)] if not board.empty else pd.DataFrame()
+            st.dataframe(board_view(sub), use_container_width=True, hide_index=True)
+            render_player_cards(sub, 10)
 
-with st.expander("Source request log"):
-    req_rows = load_json(REQUEST_LOG_FILE, [])
-    if isinstance(req_rows, list) and len(req_rows) > 0:
-        req_df = pd.DataFrame(req_rows)
-        if not req_df.empty:
-            st.dataframe(req_df.tail(120), use_container_width=True)
+    with tabs[5]:
+        st.markdown("Moneyline model uses real recent ESPN scores/team results. Sportsbook odds require ODDS_API_KEY for live market edge.")
+        st.dataframe(ml_board, use_container_width=True, hide_index=True)
+        if not ml_board.empty:
+            st.download_button("Download Moneyline CSV", ml_board.to_csv(index=False).encode("utf-8"), "wnba_moneyline_board.csv", "text/csv")
+
+    with tabs[6]:
+        player_search = st.text_input("Search player")
+        sub = board.copy()
+        if player_search and not sub.empty:
+            sub["_s"] = sub["Player"].apply(lambda x: name_score(player_search, x))
+            sub = sub[sub["_s"] >= 0.50].sort_values("_s", ascending=False).drop(columns=["_s"])
+        render_player_cards(sub, 25)
+
+    with tabs[7]:
+        c1, c2 = st.columns(2)
+        with c1:
+            st.subheader("Saved Picks")
+            saved = pd.DataFrame(load_json(PICK_LOG, []))
+            st.dataframe(saved.tail(200), use_container_width=True, hide_index=True)
+        with c2:
+            st.subheader("Graded Results")
+            results = pd.DataFrame(load_json(RESULT_LOG, []))
+            st.dataframe(results.tail(200), use_container_width=True, hide_index=True)
+        prof = calibration_profile()
+        st.json(prof)
+
+    with tabs[8]:
+        st.subheader("Line Feed Status")
+        lines = fetch_all_prop_lines()
+        st.write(f"Real prop lines found: {len(lines)}")
+        st.dataframe(lines.head(200), use_container_width=True, hide_index=True)
+
+        st.subheader("Underdog Debug — Every Pulled Candidate")
+        ud_debug = pd.DataFrame(load_json(UNDERDOG_DEBUG_FILE, []))
+        if ud_debug.empty:
+            st.info("No Underdog debug rows stored yet. Refresh the board to pull UD.")
         else:
-            st.caption("No request issues logged.")
-    else:
-        st.caption("No request issues logged.")
+            st.dataframe(ud_debug.tail(500), use_container_width=True, hide_index=True)
+
+        st.subheader("Manual Injury Controls Active")
+        st.dataframe(injury_controls, use_container_width=True, hide_index=True)
+
+        st.subheader("Defense vs Position Sample")
+        dvp = build_defense_vs_position()
+        flat_dvp = []
+        for team, by_pos in dvp.items():
+            for role, mkts in by_pos.items():
+                row = {"Opponent": team, "Role": role}
+                row.update(mkts)
+                flat_dvp.append(row)
+        st.dataframe(pd.DataFrame(flat_dvp).head(300), use_container_width=True, hide_index=True)
+        st.subheader("Request Log")
+        req = pd.DataFrame(load_json(REQUEST_LOG_FILE, []))
+        st.dataframe(req.tail(200), use_container_width=True, hide_index=True)
+        st.subheader("Team Stats Proxy")
+        st.json(build_team_recent_stats(games))
+
+
+if __name__ == "__main__":
+    main()
